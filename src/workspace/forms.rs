@@ -218,11 +218,6 @@ impl Workspace {
                             .child(self.form_field("Account", &form.account, cx))
                             .child(self.form_field("Username", &form.user, cx))
                             .child(self.form_field("Private key file", &form.private_key, cx))
-                            // Only while there is no file: a path wins, so a
-                            // key pasted beside one would be stored and unused.
-                            .children(form.private_key.read(cx).value().trim().is_empty().then(
-                                || self.form_field("or paste the key", &form.private_key_text, cx),
-                            ))
                             .child(self.form_field("Database", &form.database, cx))
                             .child(self.form_field("Warehouse", &form.warehouse, cx))
                             .child(self.form_field("Role", &form.role, cx))

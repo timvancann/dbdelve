@@ -97,8 +97,6 @@ impl Workspace {
                 host: Some(stored.host).filter(|host| !host.is_empty()),
                 user: stored.user,
                 private_key: stored.private_key.unwrap_or_default(),
-                // Never on disk. Read from the Keychain when connecting.
-                private_key_text: String::new(),
                 database: stored.database,
                 warehouse: stored.warehouse,
                 role: stored.role,
@@ -568,13 +566,12 @@ impl Workspace {
             let id = id.clone();
             async move {
                 // A file engine has nothing to authenticate to, so it never
-                // reaches the Keychain — and never triggers its prompt. Nor
-                // does an account whose key is a file.
-                if let Some(secret) = config.secret_mut()
-                    && secret.is_empty()
+                // reaches the Keychain — and never triggers its prompt.
+                if let Some(server) = config.server_mut()
+                    && server.password.is_empty()
                 {
                     match store::password(&id) {
-                        Ok(Some(password)) => *secret = password,
+                        Ok(Some(password)) => server.password = password,
                         // No keychain item is not a missing password: a blank
                         // one is valid, so this connects with what it has.
                         Ok(None) => {}

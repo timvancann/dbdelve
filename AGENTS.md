@@ -262,9 +262,8 @@ Then paste a URL and choose **Use URL**, or fill the fields in. Connecting is
 the connection test; there is deliberately no separate test button.
 
 Snowflake has no container. Its unit tests need nothing; its live tests are
-`#[ignore]`d and read `DBDELVE_SNOWFLAKE_ACCOUNT`, `_USER`, `_DATABASE` and
-one of `_PRIVATE_KEY` (a path) or `_PRIVATE_KEY_TEXT` (the key, PEM or
-base64), plus `_WAREHOUSE`, `_ROLE` and `_HOST` when set. The
+`#[ignore]`d and read `DBDELVE_SNOWFLAKE_ACCOUNT`, `_USER`, `_PRIVATE_KEY` (an
+absolute path) and `_DATABASE`, plus `_WAREHOUSE`, `_ROLE` and `_HOST` when set. The
 catalog test creates and drops a `DBDELVE_TEST` schema.
 
 SQLite has no server to connect to. Build the file once, then give the form its
@@ -425,14 +424,9 @@ Decided, recorded in the multi-engine spec, and not to be re-litigated:
   Statements are always submitted `async=true`, because a synchronous submit
   withholds its handle for up to 45 seconds and the handle is what Cancel needs.
 - **Snowflake signs in with a key pair and nothing else.** An RS256 token per
-  request, signed with `ring`. The key is a file the profile points at, or
-  text pasted into the form, which is kept in the Keychain exactly as a
-  password is and never written to `profiles.toml`; a path wins when both
-  exist. `ConnectionConfig::secret` is the one accessor for "what this
-  connection keeps in the Keychain", and it answers `None` for a key that is a
-  path so that nothing prompts on its behalf. `snowflake::key_der` reads a PEM,
-  a PEM flattened to one line, a bare base64 body, or a PEM base64-encoded
-  again, because they are the same bytes. An encrypted key is refused by name (`ring` does not
+  request, signed with `ring` from the key file the profile points at by
+  absolute path; nothing goes to the Keychain, so `ConnectionConfig::server`
+  answers `None` for it and nothing prompts on its behalf. An encrypted key is refused by name (`ring` does not
   decrypt PKCS#8). Password, OAuth, browser SSO and access tokens are not
   implemented. There is no `sslmode` to honour or weaken: the API is HTTPS and
   always verified against `webpki-roots`.

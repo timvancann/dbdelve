@@ -34,13 +34,20 @@ chmod 600 snowflake.p8
 ALTER USER my_user SET RSA_PUBLIC_KEY='MIIBIjANBgkq...';  -- the body of snowflake.pub, without its BEGIN/END lines
 ```
 
-Give the form the key one of two ways:
+The form takes the key as a file, and the path has to be **absolute**, such as
+`/Users/me/.ssh/snowflake.p8`. A relative path or one starting with `~` is
+refused: DBDelve does not expand `~`, and an app opened from Finder has no
+working directory a relative path could mean anything against. The profile
+stores the path and nothing else; the key is read from the file each time it
+is needed and never copied anywhere.
 
-- **Private key file**: a path. The profile stores the path and nothing else.
-- **Or paste the key**: the text itself, kept in the macOS Keychain like a
-  password and never written to `profiles.toml`. It can be the PEM, the PEM's
-  base64 body alone, or the whole PEM base64-encoded again, which is how a key
-  usually sits in a secrets store. If both are filled in, the file wins.
+If your key lives in a secrets store as one base64 string, write it to a file
+first:
+
+```sh
+echo 'PASTE_THE_STRING_HERE' | base64 -d > ~/.ssh/snowflake.p8
+chmod 600 ~/.ssh/snowflake.p8
+```
 
 ## The form
 
@@ -48,6 +55,7 @@ Give the form the key one of two ways:
 | --- | --- |
 | Account | The account identifier, such as `myorg-myaccount`. Pasting the sign-in URL works; the identifier is taken out of it. |
 | Username | The Snowflake user the public key is registered on. |
+| Private key file | Absolute path to the unencrypted key. |
 | Database | Required. A profile browses one database, as a Postgres connection does. |
 | Warehouse | Optional; blank uses the user's default. **Needed in practice**: see below. |
 | Role | Optional; blank uses the user's default. |

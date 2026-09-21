@@ -48,9 +48,6 @@ pub(crate) struct ConnectionForm {
     /// next.
     pub(crate) account: Entity<InputState>,
     pub(crate) private_key: Entity<InputState>,
-    /// The key as text, for someone who has it in a secrets store rather than
-    /// in a file. Masked and never prefilled, like the password.
-    pub(crate) private_key_text: Entity<InputState>,
     pub(crate) warehouse: Entity<InputState>,
     pub(crate) role: Entity<InputState>,
     /// Seconds, and blank is the same as 0: no limit. Every engine has one, so
@@ -161,13 +158,8 @@ impl ConnectionForm {
         });
         let private_key = cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder("Private key file")
+                .placeholder("Absolute path to the private key file")
                 .default_value(value(account.map(|account| account.private_key.as_str())))
-        });
-        let private_key_text = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder("PEM or base64")
-                .masked(true)
         });
         let warehouse = cx.new(|cx| {
             InputState::new(window, cx)
@@ -214,7 +206,6 @@ impl ConnectionForm {
             root_certificate,
             account: account_name,
             private_key,
-            private_key_text,
             warehouse,
             role,
             statement_timeout,
@@ -294,28 +285,23 @@ impl ConnectionForm {
         let account = crate::db::account_identifier(&read(&self.account));
         let user = read(&self.user);
         let private_key = read(&self.private_key);
-        let private_key_text = self
-            .private_key_text
-            .read(cx)
-            .unmask_value()
-            .trim()
-            .to_string();
         let database = read(&self.database);
 
         for (label, value) in [
             ("Account", &account),
             ("Username", &user),
+            ("Private key", &private_key),
             ("Database", &database),
         ] {
             if value.is_empty() {
                 return Err(format!("{label} is required."));
             }
         }
-        // One or the other. Editing a profile whose key was pasted shows
-        // neither, because the Keychain is never read back onto the screen, so
-        // both blank is only an error for a connection that does not exist yet.
-        if private_key.is_empty() && private_key_text.is_empty() && self.editing.is_none() {
-            return Err("A private key is required, as a file or pasted.".into());
+        // Absolute, because a relative one resolves against wherever the app
+        // was launched from -- `/` for one opened from Finder -- and `~` is the
+        // shell's to expand, not the file system's.
+        if !private_key.starts_with('/') {
+            return Err("Private key must be an absolute path to the key file.".into());
         }
 
         Ok(SnowflakeConfig {
@@ -325,7 +311,6 @@ impl ConnectionForm {
             host: optional(&self.host),
             user,
             private_key,
-            private_key_text,
             database,
             warehouse: optional(&self.warehouse),
             role: optional(&self.role),
@@ -419,7 +404,10 @@ pub(crate) fn password_to_persist(config: &ConnectionConfig, origin: Origin) -> 
     if origin == Origin::Environment {
         return None;
     }
-    config.secret().filter(|secret| !secret.is_empty())
+    config
+        .server()
+        .map(|server| server.password.as_str())
+        .filter(|password| !password.is_empty())
 }
 
 #[cfg(test)]

@@ -40,15 +40,12 @@ pub struct SnowflakeConfig {
     /// or a proxy is what fills it in.
     pub host: Option<String>,
     pub user: String,
-    /// Path to an unencrypted private key. A path and not a secret, so it
-    /// lives in the profile like `root_certificate` does. Blank when the key
-    /// was pasted instead.
+    /// Absolute path to an unencrypted private key. A path and not a secret,
+    /// so it lives in the profile like `root_certificate` does and the
+    /// Keychain holds nothing for this engine. Absolute because a relative one
+    /// resolves against wherever the app was launched from, which for an app
+    /// opened from Finder is `/`.
     pub private_key: String,
-    /// The key itself, for someone who has it as text rather than as a file.
-    /// A secret, so it is treated as a server's password is: never written to
-    /// `profiles.toml`, kept in the Keychain, and blank here until connecting
-    /// reads it back. Consulted only when there is no path.
-    pub private_key_text: String,
     /// One database per profile, as with Postgres. Every request carries it,
     /// which is why generated names stay two-part.
     pub database: String,
@@ -127,18 +124,11 @@ const TOKEN_LIFETIME: u64 = 59 * 60;
 /// policy requires a passphrase; the upgrade path is the `pkcs8` crate's
 /// `encryption` feature and a Keychain item for the passphrase.
 fn key_pair(config: &SnowflakeConfig) -> Result<RsaKeyPair, DbError> {
-    let (text, source) = if config.private_key.is_empty() {
-        (
-            config.private_key_text.clone(),
-            "The pasted private key".to_string(),
-        )
-    } else {
-        let path = &config.private_key;
-        let text = std::fs::read_to_string(path).map_err(|error| {
-            plain_error(format!("The private key at {path} was not read: {error}."))
-        })?;
-        (text, format!("The private key at {path}"))
-    };
+    let path = &config.private_key;
+    let text = std::fs::read_to_string(path).map_err(|error| {
+        plain_error(format!("The private key at {path} was not read: {error}."))
+    })?;
+    let source = format!("The private key at {path}");
     if text.contains("ENCRYPTED PRIVATE KEY") {
         return Err(plain_error(format!("{source} is encrypted.")));
     }
@@ -152,12 +142,11 @@ fn key_pair(config: &SnowflakeConfig) -> Result<RsaKeyPair, DbError> {
         .map_err(|error| plain_error(format!("{source} is not an RSA key: {error}.")))
 }
 
-/// The DER inside a key however it was handed over: a PEM file, that PEM with
-/// its line breaks lost to a single-line field, its base64 body alone, or the
-/// whole PEM base64-encoded once more, which is how a key tends to be kept in
-/// an environment variable or a secrets store.
+/// The DER inside a key file however the key was written to it: as PEM, as
+/// its base64 body alone, or as the whole PEM base64-encoded once more, which
+/// is how a key comes out of an environment variable or a secrets store.
 ///
-/// A PEM reader would refuse three of those four, and all four are the same
+/// A PEM reader would refuse two of those three, and all three are the same
 /// bytes. So the armour lines are dropped, what is left is decoded, and a
 /// result that turns out to be PEM itself goes round once more.
 fn key_der(text: &str) -> Option<Vec<u8>> {
@@ -1262,8 +1251,8 @@ mod tests {
 
     const LIVE: &str = "requires a Snowflake account configured through DBDELVE_SNOWFLAKE_*";
 
-    /// ACCOUNT, USER, DATABASE and one of PRIVATE_KEY (a path) or
-    /// PRIVATE_KEY_TEXT are required; WAREHOUSE, ROLE and HOST are taken when set.
+    /// ACCOUNT, USER, PRIVATE_KEY (an absolute path) and DATABASE are required;
+    /// WAREHOUSE, ROLE and HOST are taken when set.
     fn live_config() -> SnowflakeConfig {
         let required = |name: &str| {
             std::env::var(format!("DBDELVE_SNOWFLAKE_{name}")).unwrap_or_else(|_| panic!("{LIVE}"))
@@ -1273,10 +1262,7 @@ mod tests {
             account: required("ACCOUNT"),
             host: optional("HOST"),
             user: required("USER"),
-            // One or the other: a path, or the key itself in any shape
-            // `key_der` reads.
-            private_key: optional("PRIVATE_KEY").unwrap_or_default(),
-            private_key_text: optional("PRIVATE_KEY_TEXT").unwrap_or_default(),
+            private_key: required("PRIVATE_KEY"),
             database: required("DATABASE"),
             warehouse: optional("WAREHOUSE"),
             role: optional("ROLE"),
@@ -1597,51 +1583,22 @@ mod tests {
     }
 
     #[test]
-    fn a_pasted_key_is_the_same_key_however_it_was_kept() {
+    fn a_key_file_is_the_same_key_however_it_was_written() {
         let pem = std::fs::read_to_string(test_key("test-key-2048.p8")).expect("readable");
         let body: String = pem
             .lines()
             .filter(|line| !line.starts_with("-----"))
             .collect();
-        let expected = "SHA256:4/76NAyPR/D6nlGOKDw+h7DNn+cNUUuXMPNDC7pyVXs=";
+        let expected = key_der(&pem).expect("the PEM reads");
 
         for (shape, text) in [
-            ("the PEM as it is", pem.clone()),
-            // What a single-line field makes of a paste.
-            ("the PEM on one line", pem.replace('\n', "")),
             ("the base64 body alone", body),
-            // How it tends to sit in an environment variable.
+            // How it comes out of an environment variable.
             ("the PEM encoded once more", STANDARD.encode(&pem)),
         ] {
-            let config = SnowflakeConfig {
-                private_key_text: text,
-                ..Default::default()
-            };
-            let key = key_pair(&config).unwrap_or_else(|error| panic!("{shape}: {error}"));
-            assert_eq!(fingerprint(&key), expected, "{shape}");
+            assert_eq!(key_der(&text).as_ref(), Some(&expected), "{shape}");
         }
-    }
-
-    #[test]
-    fn a_pasted_key_that_is_not_one_says_so_without_repeating_it() {
-        let config = SnowflakeConfig {
-            private_key_text: "hunter2".into(),
-            ..Default::default()
-        };
-        let error = key_pair(&config).expect_err("refused");
-        assert!(
-            error.message.starts_with("The pasted private key"),
-            "{error}"
-        );
-        assert!(!error.message.contains("hunter2"), "{error}");
-    }
-
-    #[test]
-    fn a_path_wins_over_a_pasted_key() {
-        // Only one is consulted, and it is the one the profile shows.
-        let mut config = config("test-key-4096.p8");
-        config.private_key_text = "not a key".into();
-        assert!(key_pair(&config).is_ok());
+        assert_eq!(key_der("hunter2"), None);
     }
 
     #[test]
