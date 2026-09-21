@@ -209,6 +209,9 @@ impl ConnectionForm {
             }
             Engine::Postgres => ConnectionConfig::Postgres(self.server(cx)?),
             Engine::MySql => ConnectionConfig::MySql(self.server(cx)?),
+            Engine::Snowflake => {
+                return Err("The form has no Snowflake fields yet.".into());
+            }
         };
 
         Ok((name, config))
@@ -281,6 +284,7 @@ pub(crate) fn default_profile_name(config: &ConnectionConfig) -> String {
             server.database.clone()
         }
         ConnectionConfig::Sqlite { path, .. } => file_stem(path).to_string(),
+        ConnectionConfig::Snowflake(account) => account.database.clone(),
     }
 }
 

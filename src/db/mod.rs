@@ -21,7 +21,10 @@ pub use crate::tls::SslMode;
 
 mod mysql;
 mod postgres;
+mod snowflake;
 mod sqlite;
+
+pub use snowflake::SnowflakeConfig;
 
 /// Which engine a profile talks to.
 ///
@@ -34,6 +37,7 @@ pub enum Engine {
     Postgres,
     MySql,
     Sqlite,
+    Snowflake,
 }
 
 /// How much the server should be asked to do to answer "how would you run
@@ -76,13 +80,14 @@ impl ExplainMode {
 
 impl Engine {
     /// Presentation order, which is the order the form's chips appear in.
-    pub const ALL: [Self; 3] = [Self::Postgres, Self::MySql, Self::Sqlite];
+    pub const ALL: [Self; 4] = [Self::Postgres, Self::MySql, Self::Sqlite, Self::Snowflake];
 
     pub fn label(self) -> &'static str {
         match self {
             Self::Postgres => "Postgres",
             Self::MySql => "MySQL",
             Self::Sqlite => "SQLite",
+            Self::Snowflake => "Snowflake",
         }
     }
 
@@ -93,6 +98,7 @@ impl Engine {
             Self::Postgres => "postgres",
             Self::MySql => "mysql",
             Self::Sqlite => "sqlite",
+            Self::Snowflake => "snowflake",
         }
     }
 
@@ -103,6 +109,7 @@ impl Engine {
             "postgres" | "postgresql" => Ok(Self::Postgres),
             "mysql" | "mariadb" => Ok(Self::MySql),
             "sqlite" | "sqlite3" | "file" => Ok(Self::Sqlite),
+            "snowflake" => Ok(Self::Snowflake),
             other => Err(format!("{other} is not a database engine dbdelve speaks.")),
         }
     }
@@ -133,6 +140,8 @@ impl Engine {
             (Self::Postgres | Self::MySql, ExplainMode::Analyze) => Some("EXPLAIN ANALYZE "),
             (Self::Sqlite, ExplainMode::Plan) => Some("EXPLAIN QUERY PLAN "),
             (Self::Sqlite, ExplainMode::Analyze) => None,
+            // Its plan is a fourth shape `explain.rs` does not read yet.
+            (Self::Snowflake, _) => None,
         }
     }
 
@@ -153,6 +162,8 @@ impl Engine {
             Self::Postgres => None,
             Self::MySql => Some("BEGIN"),
             Self::Sqlite => Some("BEGIN"),
+            // Every statement autocommits unless the submission brackets it.
+            Self::Snowflake => Some("BEGIN"),
         }
     }
 
@@ -165,7 +176,7 @@ impl Engine {
     /// of those inside `src/db/` — the caller asks, and never matches.
     pub fn assigns_default(self) -> bool {
         match self {
-            Self::Postgres | Self::MySql => true,
+            Self::Postgres | Self::MySql | Self::Snowflake => true,
             Self::Sqlite => false,
         }
     }
@@ -176,7 +187,10 @@ impl Engine {
     /// standard way produces a statement that runs and means something else.
     fn identifier_quote(self) -> char {
         match self {
-            Self::Postgres | Self::Sqlite => '"',
+            // Snowflake folds an unquoted name to upper case and reads a quoted
+            // one exactly, and the catalog reports names as stored -- so quoting
+            // what the catalog said is always the name it meant.
+            Self::Postgres | Self::Sqlite | Self::Snowflake => '"',
             Self::MySql => '`',
         }
     }
@@ -206,7 +220,7 @@ impl Engine {
         }
     }
 
-    /// Doubling the quote is enough for two of the three: neither Postgres nor
+    /// Doubling the quote is enough for two of them: neither Postgres nor
     /// SQLite reads a backslash as an escape, the first because
     /// `standard_conforming_strings` is on by default and the second because it
     /// has no such notion at all. MySQL does, unless `NO_BACKSLASH_ESCAPES` is
@@ -215,7 +229,10 @@ impl Engine {
     pub fn quote_literal(self, value: &str) -> String {
         match self {
             Self::Postgres | Self::Sqlite => format!("'{}'", value.replace('\'', "''")),
-            Self::MySql => format!("'{}'", value.replace('\\', r"\\").replace('\'', "''")),
+            // Snowflake reads a backslash as an escape too, and unconditionally.
+            Self::MySql | Self::Snowflake => {
+                format!("'{}'", value.replace('\\', r"\\").replace('\'', "''"))
+            }
         }
     }
 
@@ -315,6 +332,7 @@ pub enum ConnectionConfig {
         path: String,
         statement_timeout: u32,
     },
+    Snowflake(SnowflakeConfig),
 }
 
 impl ConnectionConfig {
@@ -323,6 +341,7 @@ impl ConnectionConfig {
             Self::Postgres(_) => Engine::Postgres,
             Self::MySql(_) => Engine::MySql,
             Self::Sqlite { .. } => Engine::Sqlite,
+            Self::Snowflake(_) => Engine::Snowflake,
         }
     }
 
@@ -331,7 +350,7 @@ impl ConnectionConfig {
     pub fn server(&self) -> Option<&ServerConfig> {
         match self {
             Self::Postgres(server) | Self::MySql(server) => Some(server),
-            Self::Sqlite { .. } => None,
+            Self::Sqlite { .. } | Self::Snowflake(_) => None,
         }
     }
 
@@ -340,7 +359,7 @@ impl ConnectionConfig {
     pub fn server_mut(&mut self) -> Option<&mut ServerConfig> {
         match self {
             Self::Postgres(server) | Self::MySql(server) => Some(server),
-            Self::Sqlite { .. } => None,
+            Self::Sqlite { .. } | Self::Snowflake(_) => None,
         }
     }
 
@@ -368,6 +387,10 @@ impl ConnectionConfig {
                 // A URL has nowhere to say it; the form is where it is set.
                 statement_timeout: 0,
             }),
+            // Nobody pastes a Snowflake URL, because there is no such form.
+            Engine::Snowflake => {
+                Err("Snowflake has no connection URL. Fill the fields in instead.".to_string())
+            }
         }
     }
 
@@ -380,6 +403,7 @@ impl ConnectionConfig {
             Self::Sqlite {
                 statement_timeout, ..
             } => *statement_timeout,
+            Self::Snowflake(account) => account.statement_timeout,
         }
     }
 
@@ -407,6 +431,7 @@ impl ConnectionConfig {
         match self {
             Self::Postgres(server) | Self::MySql(server) => server.endpoint(),
             Self::Sqlite { path, .. } => path.clone(),
+            Self::Snowflake(account) => account.host(),
         }
     }
 }
@@ -431,6 +456,13 @@ impl Connection {
                 path,
                 statement_timeout,
             } => sqlite::Connection::open(&path, statement_timeout).map(Self::Sqlite),
+            ConnectionConfig::Snowflake(account) => Err(DbError {
+                message: format!(
+                    "{} is not reachable yet: this build cannot connect to Snowflake.",
+                    account.host()
+                ),
+                position: None,
+            }),
         }
     }
 
@@ -948,6 +980,8 @@ fn read_only_statement(engine: Engine, read_only: bool) -> Option<&'static str> 
         (Engine::MySql, true) => Some("SET SESSION TRANSACTION READ ONLY"),
         (Engine::MySql, false) => Some("SET SESSION TRANSACTION READ WRITE"),
         (Engine::Sqlite, _) => None,
+        // There is no session to set anything on.
+        (Engine::Snowflake, _) => None,
     }
 }
 
@@ -1171,6 +1205,68 @@ mod tests {
         assert_eq!(
             Engine::MySql.qualified("dbdelve_dev", "table"),
             "`dbdelve_dev`.`table`"
+        );
+    }
+
+    #[test]
+    fn snowflake_quotes_the_standard_way_and_doubles_a_backslash() {
+        // A quoted name is read exactly where a bare one is folded to upper
+        // case, so the double quote is what makes the catalog's spelling the
+        // one the server looks up.
+        assert_eq!(
+            Engine::Snowflake.quote_identifier("odd\"name"),
+            "\"odd\"\"name\""
+        );
+        // A backslash is an escape in a Snowflake string, as in MySQL. Left
+        // single, a trailing one swallows the closing quote.
+        assert_eq!(
+            Engine::Snowflake.quote_literal(r"back\slash"),
+            r"'back\\slash'"
+        );
+        assert_eq!(
+            Engine::Snowflake.qualified("PUBLIC", "ORDERS"),
+            "\"PUBLIC\".\"ORDERS\""
+        );
+    }
+
+    #[test]
+    fn snowflake_is_stored_under_its_own_name_and_has_no_url() {
+        assert_eq!(Engine::parse("snowflake"), Ok(Engine::Snowflake));
+        assert_eq!(Engine::Snowflake.as_str(), "snowflake");
+        assert!(ConnectionConfig::from_url("snowflake://account/db").is_err());
+    }
+
+    #[test]
+    fn snowflake_offers_no_explain_and_sets_nothing_for_read_only() {
+        for mode in ExplainMode::ALL {
+            assert_eq!(Engine::Snowflake.explain_prefix(mode), None);
+        }
+        // There is no session for a setting to live on.
+        assert_eq!(read_only_statement(Engine::Snowflake, true), None);
+        assert_eq!(read_only_statement(Engine::Snowflake, false), None);
+    }
+
+    #[test]
+    fn a_snowflake_config_has_no_server_half() {
+        // No password, so nothing for the credential fields or the Keychain
+        // to be asked about.
+        let mut account = SnowflakeConfig {
+            account: "myorg-myaccount".into(),
+            database: "ANALYTICS".into(),
+            statement_timeout: 30,
+            ..Default::default()
+        };
+        let config = ConnectionConfig::Snowflake(account.clone());
+        assert_eq!(config.engine(), Engine::Snowflake);
+        assert!(config.server().is_none());
+        assert_eq!(config.statement_timeout(), 30);
+        assert_eq!(config.endpoint(), "myorg-myaccount.snowflakecomputing.com");
+
+        // A host that was given wins over the one the account implies.
+        account.host = Some("myorg.privatelink.example".into());
+        assert_eq!(
+            ConnectionConfig::Snowflake(account).endpoint(),
+            "myorg.privatelink.example"
         );
     }
 

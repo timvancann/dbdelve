@@ -91,6 +91,17 @@ impl Workspace {
                     _ => ConnectionConfig::Postgres(server),
                 }
             }
+            Engine::Snowflake => ConnectionConfig::Snowflake(SnowflakeConfig {
+                account: stored.account.unwrap_or_default(),
+                // Blank on disk is the derived host, the same as absent.
+                host: Some(stored.host).filter(|host| !host.is_empty()),
+                user: stored.user,
+                private_key: stored.private_key.unwrap_or_default(),
+                database: stored.database,
+                warehouse: stored.warehouse,
+                role: stored.role,
+                statement_timeout: stored.statement_timeout.unwrap_or_default(),
+            }),
         };
         // A profile written before a buffer was a tab carries one buffer, whose
         // name is in the legacy scalar and whose text `read_scratch` migrates.
@@ -251,6 +262,8 @@ impl Workspace {
                     server.root_certificate.clone().unwrap_or_default(),
                 ),
             ],
+            // `from_url` refuses the scheme, so no URL arrives as one.
+            ConnectionConfig::Snowflake(_) => Vec::new(),
         };
         for (input, value) in filled {
             let input = input.clone();

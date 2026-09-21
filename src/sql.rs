@@ -21,7 +21,9 @@ use serde::Deserialize;
 use sqlparser::ast::{
     AlterTableOperation, CopySource, CopyTarget, Query, SetExpr, Statement, UtilityOption,
 };
-use sqlparser::dialect::{Dialect, MySqlDialect, PostgreSqlDialect, SQLiteDialect};
+use sqlparser::dialect::{
+    Dialect, MySqlDialect, PostgreSqlDialect, SQLiteDialect, SnowflakeDialect,
+};
 use sqlparser::parser::Parser as SqlParser;
 use tree_sitter::{Node, Parser, Tree};
 
@@ -1043,6 +1045,7 @@ pub(crate) fn classify(engine: Engine, sql: &str) -> Verdict {
         Engine::Postgres => Box::new(PostgreSqlDialect {}),
         Engine::MySql => Box::new(MySqlDialect {}),
         Engine::Sqlite => Box::new(SQLiteDialect {}),
+        Engine::Snowflake => Box::new(SnowflakeDialect {}),
     };
 
     // All or nothing: one statement it cannot read makes the whole submission
