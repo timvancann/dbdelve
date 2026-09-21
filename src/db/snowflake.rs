@@ -79,6 +79,28 @@ pub fn account_identifier(input: &str) -> String {
 }
 
 impl SnowflakeConfig {
+    /// The database as the server stores its name, which is what a quoted
+    /// identifier and a `SHOW` row both have to match.
+    ///
+    /// The profile holds what was typed, and the request's own `database`
+    /// field takes that as SQL would: a bare name folded to upper case. So
+    /// `analytics` and `ANALYTICS` are one database there, and would be two
+    /// here without the same folding. A name that could not be written bare
+    /// was necessarily created quoted, and is taken as it is.
+    fn stored_database(&self) -> String {
+        let bare = self
+            .database
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "_$".contains(character))
+            && !self
+                .database
+                .starts_with(|first: char| first.is_ascii_digit());
+        match bare {
+            true => self.database.to_ascii_uppercase(),
+            false => self.database.clone(),
+        }
+    }
+
     /// The host requests go to. The derived name is the service's documented
     /// default, overridable like any driver's default port.
     pub fn host(&self) -> String {
@@ -698,7 +720,12 @@ impl Connection {
         // ceiling is a schema with more key columns than that, where some keys
         // go unlisted; the upgrade path is asking the catalog for the kind and
         // using `IN TABLE` for tables.
-        let within = Engine::Snowflake.quote_identifier(schema);
+        //
+        // Named from the database down: a `SHOW` does not resolve a schema
+        // against the request's `database` the way a query does, and refuses
+        // one written without it.
+        let database = self.config.stored_database();
+        let within = Engine::Snowflake.qualified(&database, schema);
         let primary = self.query(&format!("SHOW PRIMARY KEYS IN SCHEMA {within}"))?;
         let unique = self.query(&format!("SHOW UNIQUE KEYS IN SCHEMA {within}"))?;
         let imported = self.query(&format!("SHOW IMPORTED KEYS IN SCHEMA {within}"))?;
@@ -721,7 +748,7 @@ impl Connection {
             ),
         ]
         .concat();
-        structure.foreign_keys = foreign_keys(&imported, relation, &self.config.database);
+        structure.foreign_keys = foreign_keys(&imported, relation, &database);
         Ok(structure)
     }
 }
@@ -1626,5 +1653,18 @@ mod tests {
             account_identifier("https://xy12345.eu-central-1.snowflakecomputing.com"),
             "xy12345.eu-central-1"
         );
+    }
+
+    #[test]
+    fn a_database_typed_bare_is_the_upper_case_name_the_server_stores() {
+        let named = |database: &str| SnowflakeConfig {
+            database: database.into(),
+            ..Default::default()
+        };
+        assert_eq!(named("analytics").stored_database(), "ANALYTICS");
+        assert_eq!(named("L1_PROMIS$X").stored_database(), "L1_PROMIS$X");
+        // Neither could have been created without quotes, so neither was folded.
+        assert_eq!(named("my-db").stored_database(), "my-db");
+        assert_eq!(named("1st").stored_database(), "1st");
     }
 }

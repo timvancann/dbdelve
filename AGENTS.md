@@ -441,7 +441,11 @@ Decided, recorded in the multi-engine spec, and not to be re-litigated:
   opening a Structure tab. That view has nothing naming the columns of a key,
   so keys come from `SHOW PRIMARY KEYS`, `SHOW UNIQUE KEYS` and `SHOW IMPORTED
   KEYS`, asked `IN SCHEMA` and narrowed to the relation because `IN TABLE` is
-  an error for a view. A profile is bound to one database, as on Postgres, and
+  an error for a view. The schema there is written from the database down: a
+  `SHOW` does not resolve against the request's `database` field the way a
+  query does, and refuses a bare schema with "Must specify the full search
+  path". `SnowflakeConfig::stored_database` folds a bare name to upper case
+  for it, as the server does. A profile is bound to one database, as on Postgres, and
   a foreign key into another database is listed and not followable.
 - **A Snowflake result is never editable.** Its primary keys are declared and
   not enforced, so a `WHERE` over one may name several rows, and the API says
