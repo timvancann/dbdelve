@@ -1672,4 +1672,78 @@ mod tests {
         assert_eq!(named("my-db").stored_database(), "my-db");
         assert_eq!(named("1st").stored_database(), "1st");
     }
+
+    /// The labels of the rows a filter bar's predicate keeps, out of four rows
+    /// made on the spot. There is no session, so there is no temporary table
+    /// to make them in.
+    fn kept(
+        connection: &Connection,
+        column: &str,
+        operator: crate::filter::Operator,
+        value: &str,
+    ) -> Result<Vec<String>, DbError> {
+        let predicate = crate::filter::filter_predicate(Engine::Snowflake, column, operator, value)
+            .expect("the bar adds up to a predicate");
+        let sql = format!(
+            "SELECT \"label\" FROM (\
+                 SELECT column1 AS \"label\", column2 AS \"state\", column3 AS \"n\" \
+                 FROM VALUES ('percent', '50%', 1), ('plain', '500', 2), \
+                             ('quoted', 'it''s ok\\\\', 3), ('absent', NULL, NULL)\
+             ) WHERE {predicate} ORDER BY 1"
+        );
+        Ok(connection
+            .query(&sql)?
+            .rows
+            .into_iter()
+            .filter_map(|row| row.into_iter().next().flatten())
+            .collect())
+    }
+
+    #[test]
+    #[ignore = "requires a Snowflake account configured through DBDELVE_SNOWFLAKE_*"]
+    fn live_a_filter_matches_what_its_operator_says() {
+        use crate::filter::Operator;
+        let connection = Connection::open(&live_config()).expect("connects");
+        let kept = |operator, value: &str| {
+            kept(&connection, "state", operator, value).unwrap_or_else(|error| panic!("{error}"))
+        };
+
+        // A percent sign in the value is a percent sign: '500' is not matched.
+        assert_eq!(kept(Operator::Contains, "50%"), ["percent"]);
+        assert_eq!(kept(Operator::StartsWith, "50"), ["percent", "plain"]);
+        assert_eq!(kept(Operator::EndsWith, "%"), ["percent"]);
+        assert_eq!(kept(Operator::NotContains, "5"), ["quoted"]);
+        // A quote and a trailing backslash both survive the literal.
+        assert_eq!(kept(Operator::Equals, r"it's ok\"), ["quoted"]);
+        // Anywhere in the value, as on the other engines, and `\d` arrives as
+        // `\d` rather than as `d`.
+        assert_eq!(kept(Operator::Regex, r"^5\d"), ["percent", "plain"]);
+        assert_eq!(kept(Operator::Regex, "ok"), ["quoted"]);
+        assert_eq!(kept(Operator::IsNull, ""), ["absent"]);
+        assert_eq!(kept(Operator::InList, "500, 50%"), ["percent", "plain"]);
+    }
+
+    #[test]
+    #[ignore = "requires a Snowflake account configured through DBDELVE_SNOWFLAKE_*"]
+    fn live_every_operator_is_a_statement_the_server_accepts() {
+        use crate::filter::Operator;
+        let connection = Connection::open(&live_config()).expect("connects");
+        for operator in Operator::ALL {
+            let value = match operator {
+                Operator::Between => "1..9",
+                Operator::InList | Operator::NotInList => "1, 2",
+                _ => "1",
+            };
+            // Against text every operator has to run.
+            if let Err(error) = kept(&connection, "state", operator, value) {
+                panic!("{} on a text column: {error}", operator.slug());
+            }
+            // Against a number the text operators may be refused, as `LIKE` on
+            // an integer is on Postgres. Which ones is worth knowing, and is
+            // not a failure.
+            if let Err(error) = kept(&connection, "n", operator, value) {
+                println!("{} on a number column: {error}", operator.slug());
+            }
+        }
+    }
 }
