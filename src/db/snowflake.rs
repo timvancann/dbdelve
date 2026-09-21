@@ -6,10 +6,11 @@
 //! of this directory better than it sounds: every value arrives as a JSON
 //! string, so hard rule 4's rendered text is most of the way there on arrival.
 //!
-//! The cost is that there is no session. A `USE` or an `ALTER SESSION` in one
-//! submission does not reach the next, and neither does an open transaction.
-//! That is the engine's documented behaviour and dbdelve does not paper over
-//! it; inside one multi-statement submission they hold as usual.
+//! The cost is that there is no session. Nothing set in one submission reaches
+//! the next, an open transaction included, and the API refuses a `USE` outright
+//! ("Command not supported by SQL API: USE") rather than running one it would
+//! then forget. That is the engine's behaviour and dbdelve does not paper over
+//! it: names are qualified, or resolve against the profile's database.
 
 use base64::Engine as _;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
@@ -1383,15 +1384,17 @@ mod tests {
 
     #[test]
     #[ignore = "requires a Snowflake account configured through DBDELVE_SNOWFLAKE_*"]
-    fn live_a_use_does_not_reach_the_next_run() {
-        // The statelessness the module header describes, pinned: if this ever
-        // fails the API has grown a session and the documentation is wrong.
+    fn live_a_use_is_refused_rather_than_quietly_forgotten() {
+        // The statelessness the module header describes, pinned. The API does
+        // not run a `USE` and then lose it between requests; it declines to run
+        // one at all, and says so, which is the better of the two ways to have
+        // no session.
         let connection = Connection::open(&live_config()).expect("connects");
-        connection
+        let error = connection
             .query("USE SCHEMA INFORMATION_SCHEMA")
-            .expect("runs");
-        let result = connection.query("SELECT CURRENT_SCHEMA()").expect("runs");
-        assert_ne!(result.rows[0][0].as_deref(), Some("INFORMATION_SCHEMA"));
+            .expect_err("refused");
+        println!("{error}");
+        assert!(error.message.contains("USE"), "{error}");
     }
 
     use super::super::result;

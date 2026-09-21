@@ -413,10 +413,10 @@ Decided, recorded in the multi-engine spec, and not to be re-litigated:
   goes behind the connection mutex, because the statement being cancelled is
   holding that mutex. `Connection::cancel` takes `&self` and locks nothing.
 - **Snowflake has no session, because it is spoken to over its SQL REST API.**
-  It publishes no Rust driver. Each submission is one HTTPS request, so a `USE`,
-  an `ALTER SESSION` or an open transaction in one run does not reach the next;
-  inside one multi-statement submission they hold. `live_a_use_does_not_reach_the_next_run`
-  pins it. The database, warehouse, role, timeout and `MULTI_STATEMENT_COUNT`
+  It publishes no Rust driver. Each submission is one HTTPS request, so nothing
+  set in one run reaches the next, an open transaction included. The API does
+  not even pretend: a `USE` comes back as "Command not supported by SQL API:
+  USE", which `live_a_use_is_refused_rather_than_quietly_forgotten` pins. The database, warehouse, role, timeout and `MULTI_STATEMENT_COUNT`
   are fields of the request and never SQL — hard rule 1.
 - **Snowflake has no connection mutex**, alone among the four: there is no
   socket to serialise, so a catalog load does not queue behind a slow query.

@@ -60,10 +60,11 @@ Give the form the key one of two ways:
   `INFORMATION_SCHEMA`, which needs a running warehouse, and so does opening a
   Structure tab. With no warehouse at all the connection opens and the catalog
   fails with Snowflake's own message.
-- **There is no session.** Each run is a separate request, so `USE SCHEMA`,
-  `ALTER SESSION` and an open transaction do not carry over to the next run.
-  Put them in the same submission as the statements that need them, or qualify
-  names.
+- **There is no session.** Each run is a separate request, so nothing set in
+  one run carries over to the next, an open transaction included. `USE` is
+  refused by Snowflake itself ("Command not supported by SQL API: USE").
+  Unqualified names resolve against the profile's database, so write
+  `MY_SCHEMA.MY_TABLE`.
 - **Results are read-only.** Snowflake does not enforce primary keys and does
   not say which table a result column came from, so there is no row DBDelve can
   safely name. Inserting a row from a table's tab works.
