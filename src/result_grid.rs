@@ -51,8 +51,6 @@ const CHAR_WIDTH: f32 = 7.8;
 /// Room for the sort control that rides at the trailing edge of a header, so a
 /// column sized to its own name still shows the whole name.
 const HEADER_CONTROL_WIDTH: f32 = 20.0;
-/// The follow arrow's box: a target, where the glyph alone was twelve pixels.
-const FOLLOW_BUTTON: f32 = 18.0;
 
 const MIN_COLUMN_WIDTH: f32 = 56.0;
 const MAX_COLUMN_WIDTH: f32 = 480.0;
@@ -1254,52 +1252,48 @@ impl TableDelegate for ResultGrid {
             .when_some(group.clone(), |cell, group| cell.group(group))
             .when(group.is_some(), |cell| cell.relative())
             .children(group.map(|group| {
-                // The full height of the cell and as wide as the button, so the
-                // button centres without the grid having to know its row height.
-                div()
-                    .absolute()
-                    .top_0()
-                    .bottom_0()
-                    .right(px(layout::SPACE_XS))
-                    .flex()
-                    .items_center()
-                    .child(
-                        div()
-                            .id(("follow-key", row_ix * self.columns.len() + col_ix))
-                            // A fixed box at the cell's right edge rather than a glyph
-                            // trailing the text: somewhere to aim, in the same place
-                            // in every row.
-                            //
-                            // Floated over the value's tail rather than given room
-                            // beside it. Room it holds while hidden is a gap down the
-                            // whole column; taken only on hover, the value would
-                            // reflow under the pointer. Over the top, it needs a
-                            // ground of its own or the text shows through the arrow.
-                            .size(px(FOLLOW_BUTTON))
-                            .rounded(px(4.))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .bg(overlay)
-                            .text_color(faint)
-                            .hover(|button| button.text_color(text))
-                            .when(!active, |hidden| {
-                                hidden
-                                    .opacity(0.)
-                                    .group_hover(group, |shown| shown.opacity(1.))
-                            })
-                            .child(icon(icon::FOLLOW_KEY).size(px(14.)))
-                            .on_click(cx.listener(move |table, _, window, cx| {
-                                // The action follows the active cell, and this one is
-                                // only hovered: without the move it would open the row
-                                // the ring happens to be on instead of the row clicked.
-                                table.delegate_mut().set_active(row_ix, col_ix);
-                                // Or the cell underneath takes the click as a move of
-                                // the ring it is already on.
-                                cx.stop_propagation();
-                                window.dispatch_action(Box::new(crate::FollowForeignKey), cx);
-                            })),
-                    )
+                // Pinned top and bottom, so the button is as tall as the row
+                // without the grid having to know how tall that is.
+                div().absolute().top_0().bottom_0().right_0().flex().child(
+                    div()
+                        .id(("follow-key", row_ix * self.columns.len() + col_ix))
+                        // A fixed box at the cell's right edge rather than a glyph
+                        // trailing the text: somewhere to aim, in the same place
+                        // in every row.
+                        //
+                        // Floated over the value's tail rather than given room
+                        // beside it. Room it holds while hidden is a gap down the
+                        // whole column; taken only on hover, the value would
+                        // reflow under the pointer. Over the top, it needs a
+                        // ground of its own or the text shows through the arrow.
+                        //
+                        // A square the height of the cell: the largest
+                        // target the row has to give.
+                        .h_full()
+                        .aspect_square()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .bg(overlay)
+                        .text_color(faint)
+                        .hover(|button| button.text_color(text))
+                        .when(!active, |hidden| {
+                            hidden
+                                .opacity(0.)
+                                .group_hover(group, |shown| shown.opacity(1.))
+                        })
+                        .child(icon(icon::FOLLOW_KEY).size(px(14.)))
+                        .on_click(cx.listener(move |table, _, window, cx| {
+                            // The action follows the active cell, and this one is
+                            // only hovered: without the move it would open the row
+                            // the ring happens to be on instead of the row clicked.
+                            table.delegate_mut().set_active(row_ix, col_ix);
+                            // Or the cell underneath takes the click as a move of
+                            // the ring it is already on.
+                            cx.stop_propagation();
+                            window.dispatch_action(Box::new(crate::FollowForeignKey), cx);
+                        })),
+                )
             }))
             // Dispatched rather than editing the cell here, so the mouse and
             // the keystroke cannot drift -- and so a refusal (a mode below
