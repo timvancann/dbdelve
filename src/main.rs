@@ -52,7 +52,7 @@ use actions::{
 use completion::SchemaCompletions;
 use connection_form::{ConnectionForm, default_profile_name};
 use db::{
-    Catalog, Connection, ConnectionConfig, DbError, Engine, ExplainMode, RelationKind,
+    Catalog, Connection, ConnectionConfig, DbError, Engine, ExplainMode, Fields, RelationKind,
     ServerConfig, SnowflakeConfig, SslMode,
 };
 use explorer::{ExplorerTarget, ObjectKind, PREVIEW_ROW_LIMIT, tree as build_explorer_tree};

@@ -40,6 +40,18 @@ pub enum Engine {
     Snowflake,
 }
 
+/// The shape of a connection's details. The form draws one of these and never
+/// asks which engine it is drawing for (hard rule 4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Fields {
+    /// Host, port, database, user, password and an `sslmode`.
+    Server,
+    /// A path and nothing else.
+    File,
+    /// An account reached over HTTPS with a private key.
+    Account,
+}
+
 /// How much the server should be asked to do to answer "how would you run
 /// this?".
 ///
@@ -114,11 +126,16 @@ impl Engine {
         }
     }
 
-    /// Whether the engine reaches a server rather than opening a file.
-    /// Everything a server needs — a host, credentials, TLS — is absent for the
-    /// one that does not, and this is what the form asks before drawing them.
-    pub fn is_server(self) -> bool {
-        !matches!(self, Self::Sqlite)
+    /// Which set of fields makes a connection to this engine, which is what
+    /// the form asks before drawing any. A server's host, credentials and TLS
+    /// are absent for a file, and an account has a key where a server has a
+    /// password and no transport to choose.
+    pub fn fields(self) -> Fields {
+        match self {
+            Self::Postgres | Self::MySql => Fields::Server,
+            Self::Sqlite => Fields::File,
+            Self::Snowflake => Fields::Account,
+        }
     }
 
     /// What `mode` is spelled as here, or `None` where the engine has no such
@@ -1246,6 +1263,16 @@ mod tests {
         // There is no session for a setting to live on.
         assert_eq!(read_only_statement(Engine::Snowflake, true), None);
         assert_eq!(read_only_statement(Engine::Snowflake, false), None);
+    }
+
+    #[test]
+    fn each_engine_names_the_fields_its_connection_is_made_of() {
+        // Two engines sharing a set is what lets the form keep focus where it
+        // was when the chip moves between them.
+        assert_eq!(Engine::Postgres.fields(), Fields::Server);
+        assert_eq!(Engine::MySql.fields(), Fields::Server);
+        assert_eq!(Engine::Sqlite.fields(), Fields::File);
+        assert_eq!(Engine::Snowflake.fields(), Fields::Account);
     }
 
     #[test]

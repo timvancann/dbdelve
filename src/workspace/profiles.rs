@@ -313,10 +313,11 @@ impl Workspace {
                     // Only when the field set actually changes: Postgres and
                     // MySQL show the same fields, so switching between them
                     // takes nothing away and must not take focus either.
-                    if form.engine.is_server() != engine.is_server() {
-                        form.needs_focus = Some(match engine.is_server() {
-                            true => form.host.clone(),
-                            false => form.path.clone(),
+                    if form.engine.fields() != engine.fields() {
+                        form.needs_focus = Some(match engine.fields() {
+                            Fields::Server => form.host.clone(),
+                            Fields::File => form.path.clone(),
+                            Fields::Account => form.account.clone(),
                         });
                     }
                     form.engine = engine;
