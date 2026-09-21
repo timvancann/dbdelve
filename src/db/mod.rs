@@ -24,7 +24,7 @@ mod postgres;
 mod snowflake;
 mod sqlite;
 
-pub use snowflake::SnowflakeConfig;
+pub use snowflake::{SnowflakeConfig, account_identifier};
 
 /// Which engine a profile talks to.
 ///
@@ -371,11 +371,27 @@ impl ConnectionConfig {
         }
     }
 
-    /// The same, for the one caller that fills the password in: connecting
-    /// reads it from the Keychain, which the profile on disk never holds.
-    pub fn server_mut(&mut self) -> Option<&mut ServerConfig> {
+    /// What this connection keeps in the Keychain rather than in its profile:
+    /// a server's password, or an account's key when it was pasted rather than
+    /// pointed at. `None` where there is nothing of the kind -- a file, or an
+    /// account whose key is a path -- so nothing asks the Keychain, and
+    /// triggers its prompt, on behalf of a connection that has no secret.
+    pub fn secret(&self) -> Option<&str> {
         match self {
-            Self::Postgres(server) | Self::MySql(server) => Some(server),
+            Self::Postgres(server) | Self::MySql(server) => Some(&server.password),
+            Self::Snowflake(account) if account.private_key.is_empty() => {
+                Some(&account.private_key_text)
+            }
+            Self::Sqlite { .. } | Self::Snowflake(_) => None,
+        }
+    }
+
+    pub fn secret_mut(&mut self) -> Option<&mut String> {
+        match self {
+            Self::Postgres(server) | Self::MySql(server) => Some(&mut server.password),
+            Self::Snowflake(account) if account.private_key.is_empty() => {
+                Some(&mut account.private_key_text)
+            }
             Self::Sqlite { .. } | Self::Snowflake(_) => None,
         }
     }
@@ -433,12 +449,10 @@ impl ConnectionConfig {
     /// the only reason to type one.
     pub fn needs_reconnect(&self, edited: &Self) -> bool {
         let mut current = self.clone();
-        if let Some(server) = current.server_mut()
-            && edited
-                .server()
-                .is_some_and(|server| server.password.is_empty())
+        if let Some(secret) = current.secret_mut()
+            && edited.secret().is_some_and(str::is_empty)
         {
-            server.password.clear();
+            secret.clear();
         }
         current != *edited
     }

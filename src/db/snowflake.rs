@@ -39,10 +39,15 @@ pub struct SnowflakeConfig {
     /// or a proxy is what fills it in.
     pub host: Option<String>,
     pub user: String,
-    /// Path to an unencrypted PKCS#8 PEM private key. A path and not a secret,
-    /// so it lives in the profile like `root_certificate` does and the Keychain
-    /// holds nothing for this engine.
+    /// Path to an unencrypted private key. A path and not a secret, so it
+    /// lives in the profile like `root_certificate` does. Blank when the key
+    /// was pasted instead.
     pub private_key: String,
+    /// The key itself, for someone who has it as text rather than as a file.
+    /// A secret, so it is treated as a server's password is: never written to
+    /// `profiles.toml`, kept in the Keychain, and blank here until connecting
+    /// reads it back. Consulted only when there is no path.
+    pub private_key_text: String,
     /// One database per profile, as with Postgres. Every request carries it,
     /// which is why generated names stay two-part.
     pub database: String,
@@ -54,13 +59,32 @@ pub struct SnowflakeConfig {
     pub statement_timeout: u32,
 }
 
+/// The domain an account's own host is under, when the profile names no other.
+const ACCOUNT_DOMAIN: &str = ".snowflakecomputing.com";
+
+/// The account identifier out of whatever was pasted for it. People have the
+/// URL they sign in at far more often than the identifier inside it, and the
+/// one is the other with a scheme in front and the domain behind.
+pub fn account_identifier(input: &str) -> String {
+    let input = input.trim();
+    let host = input
+        .split_once("://")
+        .map_or(input, |(_, rest)| rest)
+        .split(['/', ':', '?'])
+        .next()
+        .unwrap_or_default();
+    host.strip_suffix(ACCOUNT_DOMAIN)
+        .unwrap_or(host)
+        .to_string()
+}
+
 impl SnowflakeConfig {
     /// The host requests go to. The derived name is the service's documented
     /// default, overridable like any driver's default port.
     pub fn host(&self) -> String {
         match &self.host {
             Some(host) => host.clone(),
-            None => format!("{}.snowflakecomputing.com", self.account),
+            None => format!("{}{ACCOUNT_DOMAIN}", self.account),
         }
     }
 }
@@ -79,35 +103,52 @@ const TOKEN_LIFETIME: u64 = 59 * 60;
 /// implementation, a KDF and AES beside it. The ceiling is an account whose
 /// policy requires a passphrase; the upgrade path is the `pkcs8` crate's
 /// `encryption` feature and a Keychain item for the passphrase.
-fn key_pair(path: &str) -> Result<RsaKeyPair, DbError> {
-    let pem = std::fs::read(path).map_err(|error| {
-        plain_error(format!("The private key at {path} was not read: {error}."))
-    })?;
-    if String::from_utf8_lossy(&pem).contains("ENCRYPTED PRIVATE KEY") {
-        return Err(plain_error(format!(
-            "The private key at {path} is encrypted."
-        )));
+fn key_pair(config: &SnowflakeConfig) -> Result<RsaKeyPair, DbError> {
+    let (text, source) = if config.private_key.is_empty() {
+        (
+            config.private_key_text.clone(),
+            "The pasted private key".to_string(),
+        )
+    } else {
+        let path = &config.private_key;
+        let text = std::fs::read_to_string(path).map_err(|error| {
+            plain_error(format!("The private key at {path} was not read: {error}."))
+        })?;
+        (text, format!("The private key at {path}"))
+    };
+    if text.contains("ENCRYPTED PRIVATE KEY") {
+        return Err(plain_error(format!("{source} is encrypted.")));
     }
 
-    let rejected = |error| {
-        plain_error(format!(
-            "The private key at {path} is not an RSA key: {error}."
-        ))
-    };
-    for item in rustls_pemfile::read_all(&mut pem.as_slice()).flatten() {
-        match item {
-            rustls_pemfile::Item::Pkcs8Key(key) => {
-                return RsaKeyPair::from_pkcs8(key.secret_pkcs8_der()).map_err(rejected);
-            }
-            rustls_pemfile::Item::Pkcs1Key(key) => {
-                return RsaKeyPair::from_der(key.secret_pkcs1_der()).map_err(rejected);
-            }
-            _ => {}
-        }
+    let der =
+        key_der(&text).ok_or_else(|| plain_error(format!("{source} is not a private key.")))?;
+    // PKCS#8 is what Snowflake's instructions produce; PKCS#1 is what
+    // `BEGIN RSA PRIVATE KEY` holds, and `ring` reads either.
+    RsaKeyPair::from_pkcs8(&der)
+        .or_else(|_| RsaKeyPair::from_der(&der))
+        .map_err(|error| plain_error(format!("{source} is not an RSA key: {error}.")))
+}
+
+/// The DER inside a key however it was handed over: a PEM file, that PEM with
+/// its line breaks lost to a single-line field, its base64 body alone, or the
+/// whole PEM base64-encoded once more, which is how a key tends to be kept in
+/// an environment variable or a secrets store.
+///
+/// A PEM reader would refuse three of those four, and all four are the same
+/// bytes. So the armour lines are dropped, what is left is decoded, and a
+/// result that turns out to be PEM itself goes round once more.
+fn key_der(text: &str) -> Option<Vec<u8>> {
+    let body: String = text
+        .split("-----")
+        .filter(|part| !part.contains("PRIVATE KEY"))
+        .flat_map(str::chars)
+        .filter(|character| !character.is_whitespace())
+        .collect();
+    let decoded = STANDARD.decode(body).ok()?;
+    match std::str::from_utf8(&decoded) {
+        Ok(inner) if inner.contains("-----BEGIN") => key_der(inner),
+        _ => Some(decoded),
     }
-    Err(plain_error(format!(
-        "The file at {path} holds no PEM private key."
-    )))
 }
 
 /// A DER length: one byte up to 127, and above that a count of the bytes that
@@ -166,7 +207,7 @@ fn token_account(account: &str) -> String {
 /// millisecond, and a cache is a token that expires mid-poll on the one day
 /// the clock was adjusted. `now` is a parameter so a test can name the instant.
 fn token(config: &SnowflakeConfig, now: u64) -> Result<String, DbError> {
-    let key = key_pair(&config.private_key)?;
+    let key = key_pair(config)?;
     let subject = format!(
         "{}.{}",
         token_account(&config.account),
@@ -859,13 +900,13 @@ mod tests {
         //     | openssl dgst -sha256 -binary | openssl enc -base64
         // which is the command Snowflake's own documentation gives, so this is
         // checked against the server's arithmetic and not against our own.
-        let key = key_pair(&test_key("test-key-2048.p8")).expect("the key loads");
+        let key = key_pair(&config("test-key-2048.p8")).expect("the key loads");
         assert_eq!(
             fingerprint(&key),
             "SHA256:4/76NAyPR/D6nlGOKDw+h7DNn+cNUUuXMPNDC7pyVXs="
         );
         // Twice the size pushes both DER lengths past 255, into two bytes.
-        let key = key_pair(&test_key("test-key-4096.p8")).expect("the key loads");
+        let key = key_pair(&config("test-key-4096.p8")).expect("the key loads");
         assert_eq!(
             fingerprint(&key),
             "SHA256:cGqHm+uApyCk8eJ2AGO6ZdmR9wGFHHouRS3w/eFRGgQ="
@@ -912,7 +953,7 @@ mod tests {
     fn the_signature_verifies_against_the_public_key() {
         let token = token(&config("test-key-2048.p8"), 0).expect("signed");
         let (message, signature) = token.rsplit_once('.').expect("three parts");
-        let key = key_pair(&test_key("test-key-2048.p8")).expect("the key loads");
+        let key = key_pair(&config("test-key-2048.p8")).expect("the key loads");
         ring::signature::UnparsedPublicKey::new(
             &ring::signature::RSA_PKCS1_2048_8192_SHA256,
             key.public_key().as_ref(),
@@ -1188,8 +1229,8 @@ mod tests {
 
     const LIVE: &str = "requires a Snowflake account configured through DBDELVE_SNOWFLAKE_*";
 
-    /// ACCOUNT, USER, PRIVATE_KEY and DATABASE are required; WAREHOUSE, ROLE
-    /// and HOST are taken when set.
+    /// ACCOUNT, USER, DATABASE and one of PRIVATE_KEY (a path) or
+    /// PRIVATE_KEY_TEXT are required; WAREHOUSE, ROLE and HOST are taken when set.
     fn live_config() -> SnowflakeConfig {
         let required = |name: &str| {
             std::env::var(format!("DBDELVE_SNOWFLAKE_{name}")).unwrap_or_else(|_| panic!("{LIVE}"))
@@ -1199,7 +1240,10 @@ mod tests {
             account: required("ACCOUNT"),
             host: optional("HOST"),
             user: required("USER"),
-            private_key: required("PRIVATE_KEY"),
+            // One or the other: a path, or the key itself in any shape
+            // `key_der` reads.
+            private_key: optional("PRIVATE_KEY").unwrap_or_default(),
+            private_key_text: optional("PRIVATE_KEY_TEXT").unwrap_or_default(),
             database: required("DATABASE"),
             warehouse: optional("WAREHOUSE"),
             role: optional("ROLE"),
@@ -1515,5 +1559,72 @@ mod tests {
         connection
             .query("DROP SCHEMA DBDELVE_TEST")
             .expect("cleaned up");
+    }
+
+    #[test]
+    fn a_pasted_key_is_the_same_key_however_it_was_kept() {
+        let pem = std::fs::read_to_string(test_key("test-key-2048.p8")).expect("readable");
+        let body: String = pem
+            .lines()
+            .filter(|line| !line.starts_with("-----"))
+            .collect();
+        let expected = "SHA256:4/76NAyPR/D6nlGOKDw+h7DNn+cNUUuXMPNDC7pyVXs=";
+
+        for (shape, text) in [
+            ("the PEM as it is", pem.clone()),
+            // What a single-line field makes of a paste.
+            ("the PEM on one line", pem.replace('\n', "")),
+            ("the base64 body alone", body),
+            // How it tends to sit in an environment variable.
+            ("the PEM encoded once more", STANDARD.encode(&pem)),
+        ] {
+            let config = SnowflakeConfig {
+                private_key_text: text,
+                ..Default::default()
+            };
+            let key = key_pair(&config).unwrap_or_else(|error| panic!("{shape}: {error}"));
+            assert_eq!(fingerprint(&key), expected, "{shape}");
+        }
+    }
+
+    #[test]
+    fn a_pasted_key_that_is_not_one_says_so_without_repeating_it() {
+        let config = SnowflakeConfig {
+            private_key_text: "hunter2".into(),
+            ..Default::default()
+        };
+        let error = key_pair(&config).expect_err("refused");
+        assert!(
+            error.message.starts_with("The pasted private key"),
+            "{error}"
+        );
+        assert!(!error.message.contains("hunter2"), "{error}");
+    }
+
+    #[test]
+    fn a_path_wins_over_a_pasted_key() {
+        // Only one is consulted, and it is the one the profile shows.
+        let mut config = config("test-key-4096.p8");
+        config.private_key_text = "not a key".into();
+        assert!(key_pair(&config).is_ok());
+    }
+
+    #[test]
+    fn an_account_is_found_inside_the_url_it_was_pasted_as() {
+        for input in [
+            "myorg-myaccount",
+            "myorg-myaccount.snowflakecomputing.com",
+            "https://myorg-myaccount.snowflakecomputing.com",
+            "https://myorg-myaccount.snowflakecomputing.com/console/login?x=1",
+            "  https://myorg-myaccount.snowflakecomputing.com:443/ ",
+        ] {
+            assert_eq!(account_identifier(input), "myorg-myaccount", "{input}");
+        }
+        // A legacy locator keeps its region: the host needs it, and the token
+        // drops it for itself.
+        assert_eq!(
+            account_identifier("https://xy12345.eu-central-1.snowflakecomputing.com"),
+            "xy12345.eu-central-1"
+        );
     }
 }
