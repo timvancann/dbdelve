@@ -1101,9 +1101,9 @@ impl TableDelegate for ResultGrid {
         window: &mut Window,
         cx: &mut Context<TableState<Self>>,
     ) -> impl IntoElement {
-        let (text, faint, edited_bg, active_ring, hover_bg) = {
+        let (text, faint, edited_bg, active_ring, overlay) = {
             let t = theme(cx);
-            (t.text, t.text_faint, t.edited, t.accent, t.element_hover)
+            (t.text, t.text_faint, t.edited, t.accent, t.overlay)
         };
         let base = div()
             .id(("cell", row_ix * self.columns.len() + col_ix))
@@ -1252,37 +1252,54 @@ impl TableDelegate for ResultGrid {
             // The workspace owns the statement and the tabs and the grid owns
             // neither, so this leaves exactly as a header's sort click does.
             .when_some(group.clone(), |cell, group| cell.group(group))
+            .when(group.is_some(), |cell| cell.relative())
             .children(group.map(|group| {
+                // The full height of the cell and as wide as the button, so the
+                // button centres without the grid having to know its row height.
                 div()
-                    .id(("follow-key", row_ix * self.columns.len() + col_ix))
-                    // A fixed box at the cell's right edge rather than a glyph
-                    // trailing the text: somewhere to aim, in the same place
-                    // in every row.
-                    .ml(px(layout::SPACE_XS))
-                    .flex_shrink_0()
-                    .size(px(FOLLOW_BUTTON))
-                    .rounded(px(4.))
+                    .absolute()
+                    .top_0()
+                    .bottom_0()
+                    .right(px(layout::SPACE_XS))
                     .flex()
                     .items_center()
-                    .justify_center()
-                    .text_color(faint)
-                    .hover(|button| button.bg(hover_bg).text_color(text))
-                    .when(!active, |hidden| {
-                        hidden
-                            .opacity(0.)
-                            .group_hover(group, |shown| shown.opacity(1.))
-                    })
-                    .child(icon(icon::FOLLOW_KEY).size(px(14.)))
-                    .on_click(cx.listener(move |table, _, window, cx| {
-                        // The action follows the active cell, and this one is
-                        // only hovered: without the move it would open the row
-                        // the ring happens to be on instead of the row clicked.
-                        table.delegate_mut().set_active(row_ix, col_ix);
-                        // Or the cell underneath takes the click as a move of
-                        // the ring it is already on.
-                        cx.stop_propagation();
-                        window.dispatch_action(Box::new(crate::FollowForeignKey), cx);
-                    }))
+                    .child(
+                        div()
+                            .id(("follow-key", row_ix * self.columns.len() + col_ix))
+                            // A fixed box at the cell's right edge rather than a glyph
+                            // trailing the text: somewhere to aim, in the same place
+                            // in every row.
+                            //
+                            // Floated over the value's tail rather than given room
+                            // beside it. Room it holds while hidden is a gap down the
+                            // whole column; taken only on hover, the value would
+                            // reflow under the pointer. Over the top, it needs a
+                            // ground of its own or the text shows through the arrow.
+                            .size(px(FOLLOW_BUTTON))
+                            .rounded(px(4.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .bg(overlay)
+                            .text_color(faint)
+                            .hover(|button| button.text_color(text))
+                            .when(!active, |hidden| {
+                                hidden
+                                    .opacity(0.)
+                                    .group_hover(group, |shown| shown.opacity(1.))
+                            })
+                            .child(icon(icon::FOLLOW_KEY).size(px(14.)))
+                            .on_click(cx.listener(move |table, _, window, cx| {
+                                // The action follows the active cell, and this one is
+                                // only hovered: without the move it would open the row
+                                // the ring happens to be on instead of the row clicked.
+                                table.delegate_mut().set_active(row_ix, col_ix);
+                                // Or the cell underneath takes the click as a move of
+                                // the ring it is already on.
+                                cx.stop_propagation();
+                                window.dispatch_action(Box::new(crate::FollowForeignKey), cx);
+                            })),
+                    )
             }))
             // Dispatched rather than editing the cell here, so the mouse and
             // the keystroke cannot drift -- and so a refusal (a mode below
