@@ -20,7 +20,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 
-use super::{Catalog, Cell, Column, DbError, QueryResult, Structure, plain_error};
+use super::{
+    Catalog, Cell, Column, DbError, Engine, ForeignKey, NamedDefinition, QueryResult, Structure,
+    assemble_catalog, assemble_structure, plain_error,
+};
 
 /// What it takes to reach one database in one Snowflake account.
 ///
@@ -627,17 +630,207 @@ impl Connection {
         Ok(())
     }
 
+    /// Read through `INFORMATION_SCHEMA`, which needs a running warehouse --
+    /// so connecting resumes one that was suspended, and so does opening a
+    /// Structure tab. That is the price of the idiomatic catalog, and it is
+    /// the server's message the user sees when there is no warehouse to run.
     pub fn catalog(&self) -> Result<Catalog, DbError> {
-        Err(plain_error(
-            "This build does not read a Snowflake catalog yet.".to_string(),
-        ))
+        assemble_catalog(self.query(RELATIONS_SQL)?, self.query(ROUTINES_SQL)?)
     }
 
-    pub fn structure(&self, _schema: &str, _relation: &str) -> Result<Structure, DbError> {
-        Err(plain_error(
-            "This build does not read a Snowflake relation's structure yet.".to_string(),
-        ))
+    pub fn structure(&self, schema: &str, relation: &str) -> Result<Structure, DbError> {
+        let literal = |value: &str| Engine::Snowflake.quote_literal(value);
+        let columns = self.query(
+            &COLUMNS_SQL
+                .replace("{schema}", &literal(schema))
+                .replace("{relation}", &literal(relation)),
+        )?;
+        let mut structure =
+            assemble_structure(columns, QueryResult::default(), QueryResult::default())?;
+
+        // `INFORMATION_SCHEMA` names a constraint and its type but has no view
+        // of the columns in it, so the keys come from `SHOW`.
+        //
+        // ponytail: asked of the schema and narrowed here rather than asked of
+        // the relation, because `IN TABLE` is an error for a view and this has
+        // to answer for any relation. `SHOW` stops at 10 000 rows, so the
+        // ceiling is a schema with more key columns than that, where some keys
+        // go unlisted; the upgrade path is asking the catalog for the kind and
+        // using `IN TABLE` for tables.
+        let within = Engine::Snowflake.quote_identifier(schema);
+        let primary = self.query(&format!("SHOW PRIMARY KEYS IN SCHEMA {within}"))?;
+        let unique = self.query(&format!("SHOW UNIQUE KEYS IN SCHEMA {within}"))?;
+        let imported = self.query(&format!("SHOW IMPORTED KEYS IN SCHEMA {within}"))?;
+
+        structure.constraints = [
+            key_definitions(
+                &primary,
+                "table_name",
+                relation,
+                "constraint_name",
+                "PRIMARY KEY",
+            ),
+            key_definitions(&unique, "table_name", relation, "constraint_name", "UNIQUE"),
+            key_definitions(
+                &imported,
+                "fk_table_name",
+                relation,
+                "fk_name",
+                "FOREIGN KEY",
+            ),
+        ]
+        .concat();
+        structure.foreign_keys = foreign_keys(&imported, relation, &self.config.database);
+        Ok(structure)
     }
+}
+
+/// Aliased in double quotes throughout: an unquoted alias comes back folded to
+/// upper case, and the assemblers look these names up exactly.
+const RELATIONS_SQL: &str = r#"
+SELECT TABLE_SCHEMA AS "schema_name",
+       TABLE_NAME AS "relation_name",
+       CASE TABLE_TYPE
+           WHEN 'VIEW' THEN 'view'
+           WHEN 'MATERIALIZED VIEW' THEN 'materialized_view'
+           WHEN 'EXTERNAL TABLE' THEN 'foreign_table'
+           -- Temporary, transient, dynamic, event, hybrid and Iceberg tables
+           -- are all browsed the way a table is.
+           ELSE 'table'
+       END AS "relation_kind"
+FROM INFORMATION_SCHEMA.TABLES
+WHERE TABLE_SCHEMA <> 'INFORMATION_SCHEMA'
+ORDER BY 1, 2"#;
+
+const ROUTINES_SQL: &str = r#"
+SELECT FUNCTION_SCHEMA AS "schema_name",
+       FUNCTION_NAME AS "routine_name",
+       'function' AS "routine_kind",
+       COALESCE(ARGUMENT_SIGNATURE, '') AS "identity_arguments",
+       COALESCE(DATA_TYPE, '') AS "result_type",
+       COALESCE(FUNCTION_LANGUAGE, '') AS "language",
+       COALESCE(FUNCTION_DEFINITION, '') AS "definition"
+FROM INFORMATION_SCHEMA.FUNCTIONS
+UNION ALL
+SELECT PROCEDURE_SCHEMA,
+       PROCEDURE_NAME,
+       'procedure',
+       COALESCE(ARGUMENT_SIGNATURE, ''),
+       COALESCE(DATA_TYPE, ''),
+       COALESCE(PROCEDURE_LANGUAGE, ''),
+       COALESCE(PROCEDURE_DEFINITION, '')
+FROM INFORMATION_SCHEMA.PROCEDURES
+ORDER BY 1, 2"#;
+
+/// The type is spelled the way a result column's is, lower case with its
+/// precision, so a relation reads the same in its Structure tab and its grid.
+const COLUMNS_SQL: &str = r#"
+SELECT COLUMN_NAME AS "column_name",
+       LOWER(CASE
+           WHEN DATA_TYPE = 'NUMBER'
+               THEN 'NUMBER(' || NUMERIC_PRECISION || ',' || NUMERIC_SCALE || ')'
+           WHEN DATA_TYPE = 'TEXT'
+               THEN 'VARCHAR(' || CHARACTER_MAXIMUM_LENGTH || ')'
+           ELSE DATA_TYPE
+       END) AS "data_type",
+       LOWER(IS_NULLABLE) AS "nullable",
+       COALESCE(COLUMN_DEFAULT, '') AS "column_default"
+FROM INFORMATION_SCHEMA.COLUMNS
+WHERE TABLE_SCHEMA = {schema} AND TABLE_NAME = {relation}
+ORDER BY ORDINAL_POSITION"#;
+
+/// A cell of a `SHOW` result by its column's fixed name.
+fn shown<'a>(result: &'a QueryResult, row: &'a [Cell], name: &str) -> Option<&'a str> {
+    let index = result
+        .columns
+        .iter()
+        .position(|column| column.name == name)?;
+    row.get(index)?.as_deref()
+}
+
+/// The rows of a key `SHOW` that belong to `relation`, in key order.
+fn key_rows<'a>(result: &'a QueryResult, table_column: &str, relation: &str) -> Vec<&'a Vec<Cell>> {
+    let mut rows: Vec<_> = result
+        .rows
+        .iter()
+        .filter(|row| shown(result, row, table_column) == Some(relation))
+        .collect();
+    rows.sort_by_key(|row| {
+        shown(result, row, "key_sequence")
+            .and_then(|sequence| sequence.parse::<u32>().ok())
+            .unwrap_or(0)
+    });
+    rows
+}
+
+/// One definition per constraint, its columns in key order -- a composite key
+/// arrives as a row per column and is one constraint.
+fn key_definitions(
+    result: &QueryResult,
+    table_column: &str,
+    relation: &str,
+    name_column: &str,
+    keyword: &str,
+) -> Vec<NamedDefinition> {
+    let quote = |name: &str| Engine::Snowflake.quote_identifier(name);
+    let foreign = keyword == "FOREIGN KEY";
+    let column = if foreign {
+        "fk_column_name"
+    } else {
+        "column_name"
+    };
+
+    let mut constraints = std::collections::BTreeMap::<&str, Vec<&Vec<Cell>>>::new();
+    for row in key_rows(result, table_column, relation) {
+        let name = shown(result, row, name_column).unwrap_or_default();
+        constraints.entry(name).or_default().push(row);
+    }
+
+    constraints
+        .into_iter()
+        .map(|(name, rows)| {
+            let list = |column: &str| {
+                rows.iter()
+                    .filter_map(|row| shown(result, row, column))
+                    .map(quote)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            let mut definition = format!("{keyword} ({})", list(column));
+            if foreign && let Some(first) = rows.first() {
+                definition.push_str(&format!(
+                    " REFERENCES {} ({})",
+                    Engine::Snowflake.qualified(
+                        shown(result, first, "pk_schema_name").unwrap_or_default(),
+                        shown(result, first, "pk_table_name").unwrap_or_default(),
+                    ),
+                    list("pk_column_name")
+                ));
+            }
+            NamedDefinition {
+                name: name.to_string(),
+                definition,
+            }
+        })
+        .collect()
+}
+
+/// The keys that can be followed. One that points into another database is
+/// left out: a [`ForeignKey`] names a schema and a table, a profile is bound to
+/// one database, and following it would filter a table of the same name here.
+fn foreign_keys(imported: &QueryResult, relation: &str, database: &str) -> Vec<ForeignKey> {
+    key_rows(imported, "fk_table_name", relation)
+        .into_iter()
+        .filter(|row| shown(imported, row, "pk_database_name") == Some(database))
+        .filter_map(|row| {
+            Some(ForeignKey {
+                column: shown(imported, row, "fk_column_name")?.to_string(),
+                referenced_schema: shown(imported, row, "pk_schema_name")?.to_string(),
+                referenced_table: shown(imported, row, "pk_table_name")?.to_string(),
+                referenced_column: shown(imported, row, "pk_column_name")?.to_string(),
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -1123,5 +1316,204 @@ mod tests {
             .expect("runs");
         let result = connection.query("SELECT CURRENT_SCHEMA()").expect("runs");
         assert_ne!(result.rows[0][0].as_deref(), Some("INFORMATION_SCHEMA"));
+    }
+
+    use super::super::result;
+
+    #[test]
+    fn a_composite_key_is_one_constraint_with_its_columns_in_order() {
+        // A row per column, and not necessarily in key order.
+        let primary = result(
+            &[
+                "table_name",
+                "column_name",
+                "key_sequence",
+                "constraint_name",
+            ],
+            &[
+                &[
+                    Some("ORDER_LINES"),
+                    Some("LINE"),
+                    Some("2"),
+                    Some("PK_LINES"),
+                ],
+                &[Some("ORDERS"), Some("ID"), Some("1"), Some("PK_ORDERS")],
+                &[
+                    Some("ORDER_LINES"),
+                    Some("ORDER_ID"),
+                    Some("1"),
+                    Some("PK_LINES"),
+                ],
+            ],
+        );
+        assert_eq!(
+            key_definitions(
+                &primary,
+                "table_name",
+                "ORDER_LINES",
+                "constraint_name",
+                "PRIMARY KEY"
+            ),
+            vec![NamedDefinition {
+                name: "PK_LINES".into(),
+                definition: r#"PRIMARY KEY ("ORDER_ID", "LINE")"#.into(),
+            }]
+        );
+    }
+
+    fn imported_keys() -> QueryResult {
+        result(
+            &[
+                "pk_database_name",
+                "pk_schema_name",
+                "pk_table_name",
+                "pk_column_name",
+                "fk_table_name",
+                "fk_column_name",
+                "key_sequence",
+                "fk_name",
+            ],
+            &[
+                &[
+                    Some("ANALYTICS"),
+                    Some("PUBLIC"),
+                    Some("ORDERS"),
+                    Some("ID"),
+                    Some("ORDER_LINES"),
+                    Some("ORDER_ID"),
+                    Some("1"),
+                    Some("FK_ORDER"),
+                ],
+                &[
+                    Some("REFERENCE"),
+                    Some("PUBLIC"),
+                    Some("PRODUCTS"),
+                    Some("SKU"),
+                    Some("ORDER_LINES"),
+                    Some("SKU"),
+                    Some("1"),
+                    Some("FK_PRODUCT"),
+                ],
+            ],
+        )
+    }
+
+    #[test]
+    fn a_foreign_key_is_rendered_with_what_it_references() {
+        let definitions = key_definitions(
+            &imported_keys(),
+            "fk_table_name",
+            "ORDER_LINES",
+            "fk_name",
+            "FOREIGN KEY",
+        );
+        assert_eq!(
+            definitions[0].definition,
+            r#"FOREIGN KEY ("ORDER_ID") REFERENCES "PUBLIC"."ORDERS" ("ID")"#
+        );
+        assert_eq!(definitions.len(), 2);
+    }
+
+    #[test]
+    fn a_key_into_another_database_is_shown_but_not_followed() {
+        // Following it would filter a `PRODUCTS` in this database, if there
+        // happened to be one, on a key that belongs to a different table.
+        let followed = foreign_keys(&imported_keys(), "ORDER_LINES", "ANALYTICS");
+        assert_eq!(
+            followed,
+            vec![ForeignKey {
+                column: "ORDER_ID".into(),
+                referenced_schema: "PUBLIC".into(),
+                referenced_table: "ORDERS".into(),
+                referenced_column: "ID".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn a_catalog_result_in_its_aliases_is_what_the_assemblers_read() {
+        // The aliases in the SQL above and the names the shared assemblers look
+        // up are the same strings in two places; this is what holds them together.
+        for alias in ["schema_name", "relation_name", "relation_kind"] {
+            assert!(
+                RELATIONS_SQL.contains(&format!("AS \"{alias}\"")),
+                "{alias}"
+            );
+        }
+        for alias in [
+            "schema_name",
+            "routine_name",
+            "routine_kind",
+            "identity_arguments",
+            "result_type",
+            "language",
+            "definition",
+        ] {
+            assert!(ROUTINES_SQL.contains(&format!("AS \"{alias}\"")), "{alias}");
+        }
+        for alias in ["column_name", "data_type", "nullable", "column_default"] {
+            assert!(COLUMNS_SQL.contains(&format!("AS \"{alias}\"")), "{alias}");
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a Snowflake account configured through DBDELVE_SNOWFLAKE_*"]
+    fn live_catalog_and_structure_round_trip() {
+        // Needs a warehouse and the right to create a schema in the database.
+        let connection = Connection::open(&live_config()).expect("connects");
+        connection
+            .query(
+                "CREATE OR REPLACE SCHEMA DBDELVE_TEST; \
+                 CREATE TABLE DBDELVE_TEST.ORDERS (ID NUMBER(38,0) PRIMARY KEY, NOTE VARCHAR(40) DEFAULT 'x'); \
+                 CREATE TABLE DBDELVE_TEST.ORDER_LINES (ORDER_ID NUMBER(38,0) NOT NULL REFERENCES DBDELVE_TEST.ORDERS (ID), \
+                     LINE NUMBER(38,0) NOT NULL, SEEN TIMESTAMP_NTZ, PRIMARY KEY (ORDER_ID, LINE)); \
+                 CREATE VIEW DBDELVE_TEST.RECENT AS SELECT * FROM DBDELVE_TEST.ORDERS",
+            )
+            .expect("the fixture schema is created");
+
+        let catalog = connection.catalog().expect("the catalog loads");
+        let schema = catalog
+            .schemas
+            .iter()
+            .find(|schema| schema.name == "DBDELVE_TEST")
+            .expect("the schema is listed");
+        let kinds: Vec<_> = schema
+            .relations
+            .iter()
+            .map(|r| (r.name.as_str(), r.kind))
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                ("ORDERS", super::super::RelationKind::Table),
+                ("ORDER_LINES", super::super::RelationKind::Table),
+                ("RECENT", super::super::RelationKind::View),
+            ]
+        );
+        assert!(
+            catalog
+                .schemas
+                .iter()
+                .all(|schema| schema.name != "INFORMATION_SCHEMA")
+        );
+
+        let lines = connection
+            .structure("DBDELVE_TEST", "ORDER_LINES")
+            .expect("described");
+        println!("{lines:#?}");
+        assert_eq!(lines.columns[0].data_type, "number(38,0)");
+        assert!(!lines.columns[0].nullable);
+        assert_eq!(lines.foreign_keys.len(), 1);
+        assert_eq!(lines.constraints.len(), 2);
+        // A view has columns and no keys, and asking is not an error.
+        let view = connection
+            .structure("DBDELVE_TEST", "RECENT")
+            .expect("described");
+        assert_eq!(view.columns.len(), 2);
+        assert!(view.constraints.is_empty());
+
+        connection
+            .query("DROP SCHEMA DBDELVE_TEST")
+            .expect("cleaned up");
     }
 }
