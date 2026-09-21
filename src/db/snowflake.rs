@@ -797,6 +797,11 @@ SELECT COLUMN_NAME AS "column_name",
        LOWER(CASE
            WHEN DATA_TYPE = 'NUMBER'
                THEN 'NUMBER(' || NUMERIC_PRECISION || ',' || NUMERIC_SCALE || ')'
+           -- A VARCHAR declared without a length reports the most the account
+           -- allows: 16 MB, or 128 MB on a newer one. Nobody chose that number,
+           -- and repeated down a column list it buries the ones somebody did.
+           WHEN DATA_TYPE = 'TEXT' AND CHARACTER_MAXIMUM_LENGTH IN (16777216, 134217728)
+               THEN 'VARCHAR'
            WHEN DATA_TYPE = 'TEXT'
                THEN 'VARCHAR(' || CHARACTER_MAXIMUM_LENGTH || ')'
            ELSE DATA_TYPE
