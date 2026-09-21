@@ -443,6 +443,7 @@ pub enum Connection {
     Postgres(postgres::Connection),
     MySql(mysql::Connection),
     Sqlite(sqlite::Connection),
+    Snowflake(snowflake::Connection),
 }
 
 impl Connection {
@@ -456,13 +457,9 @@ impl Connection {
                 path,
                 statement_timeout,
             } => sqlite::Connection::open(&path, statement_timeout).map(Self::Sqlite),
-            ConnectionConfig::Snowflake(account) => Err(DbError {
-                message: format!(
-                    "{} is not reachable yet: this build cannot connect to Snowflake.",
-                    account.host()
-                ),
-                position: None,
-            }),
+            ConnectionConfig::Snowflake(account) => {
+                snowflake::Connection::open(&account).map(Self::Snowflake)
+            }
         }
     }
 
@@ -476,6 +473,7 @@ impl Connection {
             Self::Postgres(connection) => connection.query(sql),
             Self::MySql(connection) => connection.query(sql),
             Self::Sqlite(connection) => connection.query(sql),
+            Self::Snowflake(connection) => connection.query(sql),
         }
     }
 
@@ -484,6 +482,7 @@ impl Connection {
             Self::Postgres(connection) => connection.catalog(),
             Self::MySql(connection) => connection.catalog(),
             Self::Sqlite(connection) => connection.catalog(),
+            Self::Snowflake(connection) => connection.catalog(),
         }
     }
 
@@ -492,6 +491,7 @@ impl Connection {
             Self::Postgres(connection) => connection.structure(schema, relation),
             Self::MySql(connection) => connection.structure(schema, relation),
             Self::Sqlite(connection) => connection.structure(schema, relation),
+            Self::Snowflake(connection) => connection.structure(schema, relation),
         }
     }
 
@@ -519,6 +519,7 @@ impl Connection {
             Self::Postgres(connection) => connection.cancel(),
             Self::MySql(connection) => connection.cancel(),
             Self::Sqlite(connection) => connection.cancel(),
+            Self::Snowflake(connection) => connection.cancel(),
         }
     }
 
@@ -535,6 +536,7 @@ impl Connection {
             Self::Postgres(_) => Engine::Postgres,
             Self::MySql(_) => Engine::MySql,
             Self::Sqlite(_) => Engine::Sqlite,
+            Self::Snowflake(_) => Engine::Snowflake,
         };
         let Some(statement) = read_only_statement(engine, read_only) else {
             return Ok(());

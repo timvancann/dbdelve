@@ -11,6 +11,17 @@
 //! That is the engine's documented behaviour and dbdelve does not paper over
 //! it; inside one multi-statement submission they hold as usual.
 
+use base64::Engine as _;
+use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+use ring::signature::{KeyPair, RSA_PKCS1_SHA256, RsaKeyPair};
+
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use serde_json::{Value, json};
+
+use super::{Catalog, Cell, Column, DbError, QueryResult, Structure, plain_error};
+
 /// What it takes to reach one database in one Snowflake account.
 ///
 /// Its own struct rather than a `ServerConfig`: there is no port, no password
@@ -48,5 +59,1069 @@ impl SnowflakeConfig {
             Some(host) => host.clone(),
             None => format!("{}.snowflakecomputing.com", self.account),
         }
+    }
+}
+
+/// The token is good for an hour at most, and the server rejects one that
+/// claims longer. A minute short of that leaves room for a clock that is not
+/// quite the server's.
+const TOKEN_LIFETIME: u64 = 59 * 60;
+
+/// The private key a profile names, read fresh each time so replacing the file
+/// takes effect without a reconnect.
+///
+/// An encrypted key is refused by name rather than prompted for.
+///
+/// ponytail: `ring` does not decrypt PKCS#8, and doing it means a PBES2
+/// implementation, a KDF and AES beside it. The ceiling is an account whose
+/// policy requires a passphrase; the upgrade path is the `pkcs8` crate's
+/// `encryption` feature and a Keychain item for the passphrase.
+fn key_pair(path: &str) -> Result<RsaKeyPair, DbError> {
+    let pem = std::fs::read(path).map_err(|error| {
+        plain_error(format!("The private key at {path} was not read: {error}."))
+    })?;
+    if String::from_utf8_lossy(&pem).contains("ENCRYPTED PRIVATE KEY") {
+        return Err(plain_error(format!(
+            "The private key at {path} is encrypted."
+        )));
+    }
+
+    let rejected = |error| {
+        plain_error(format!(
+            "The private key at {path} is not an RSA key: {error}."
+        ))
+    };
+    for item in rustls_pemfile::read_all(&mut pem.as_slice()).flatten() {
+        match item {
+            rustls_pemfile::Item::Pkcs8Key(key) => {
+                return RsaKeyPair::from_pkcs8(key.secret_pkcs8_der()).map_err(rejected);
+            }
+            rustls_pemfile::Item::Pkcs1Key(key) => {
+                return RsaKeyPair::from_der(key.secret_pkcs1_der()).map_err(rejected);
+            }
+            _ => {}
+        }
+    }
+    Err(plain_error(format!(
+        "The file at {path} holds no PEM private key."
+    )))
+}
+
+/// A DER length: one byte up to 127, and above that a count of the bytes that
+/// follow. A 2048-bit key is already past the short form.
+fn der_length(length: usize) -> Vec<u8> {
+    if length < 0x80 {
+        return vec![length as u8];
+    }
+    let bytes = length.to_be_bytes();
+    let significant = &bytes[bytes.iter().take_while(|byte| **byte == 0).count()..];
+    let mut encoded = vec![0x80 | significant.len() as u8];
+    encoded.extend_from_slice(significant);
+    encoded
+}
+
+fn der(tag: u8, content: &[u8]) -> Vec<u8> {
+    let mut encoded = vec![tag];
+    encoded.extend(der_length(content.len()));
+    encoded.extend_from_slice(content);
+    encoded
+}
+
+/// `SHA256:` and the digest of the public key, which is how the server finds
+/// the key the token claims to be signed with.
+///
+/// The server hashes a SubjectPublicKeyInfo, and `ring` hands out the bare
+/// PKCS#1 key inside one -- so the wrapper is rebuilt here: the RSA algorithm
+/// identifier, then the key as a bit string with no unused bits.
+fn fingerprint(key: &RsaKeyPair) -> String {
+    // OID 1.2.840.113549.1.1.1 (rsaEncryption) with its NULL parameters.
+    const RSA_ALGORITHM: [u8; 15] = [
+        0x30, 0x0d, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01, 0x05, 0x00,
+    ];
+    let mut bits = vec![0];
+    bits.extend_from_slice(key.public_key().as_ref());
+    let mut info = RSA_ALGORITHM.to_vec();
+    info.extend(der(0x03, &bits));
+
+    let digest = ring::digest::digest(&ring::digest::SHA256, &der(0x30, &info));
+    format!("SHA256:{}", STANDARD.encode(digest))
+}
+
+/// The account as a token names it: upper case, and without the region a
+/// legacy locator carries after its first dot.
+fn token_account(account: &str) -> String {
+    account
+        .split('.')
+        .next()
+        .unwrap_or(account)
+        .to_ascii_uppercase()
+}
+
+/// A key-pair token for one request, valid from `now`.
+///
+/// Minted per request rather than cached: a signature costs about a
+/// millisecond, and a cache is a token that expires mid-poll on the one day
+/// the clock was adjusted. `now` is a parameter so a test can name the instant.
+fn token(config: &SnowflakeConfig, now: u64) -> Result<String, DbError> {
+    let key = key_pair(&config.private_key)?;
+    let subject = format!(
+        "{}.{}",
+        token_account(&config.account),
+        config.user.to_ascii_uppercase()
+    );
+    let claims = json!({
+        "iss": format!("{subject}.{}", fingerprint(&key)),
+        "sub": subject,
+        "iat": now,
+        "exp": now + TOKEN_LIFETIME,
+    });
+
+    let message = format!(
+        "{}.{}",
+        URL_SAFE_NO_PAD.encode(r#"{"alg":"RS256","typ":"JWT"}"#),
+        URL_SAFE_NO_PAD.encode(claims.to_string())
+    );
+    let mut signature = vec![0; key.public().modulus_len()];
+    key.sign(
+        &RSA_PKCS1_SHA256,
+        &ring::rand::SystemRandom::new(),
+        message.as_bytes(),
+        &mut signature,
+    )
+    .map_err(|error| plain_error(format!("The token was not signed: {error}.")))?;
+
+    Ok(format!("{message}.{}", URL_SAFE_NO_PAD.encode(signature)))
+}
+
+/// One column of a result, as the API describes it.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Deserialize)]
+struct RowType {
+    name: String,
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(default)]
+    precision: Option<u32>,
+    #[serde(default)]
+    scale: Option<u32>,
+}
+
+/// The type the way someone writing Snowflake SQL spells it, since the wire
+/// names are the storage classes behind them: every integer and decimal is
+/// `fixed`, every string `text`.
+fn data_type(row_type: &RowType) -> String {
+    match row_type.kind.as_str() {
+        "fixed" => match (row_type.precision, row_type.scale) {
+            (Some(precision), Some(scale)) => format!("number({precision},{scale})"),
+            _ => "number".to_string(),
+        },
+        "real" => "float".to_string(),
+        "text" => "varchar".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// Days since 1970-01-01 as a calendar date, by Howard Hinnant's
+/// `civil_from_days`. Written out because `time` and `chrono` are both only
+/// transitive here, and neither is worth naming for one conversion.
+fn civil_date(days: i64) -> (i64, u32, u32) {
+    let shifted = days + 719_468;
+    let era = shifted.div_euclid(146_097);
+    let day_of_era = shifted.rem_euclid(146_097);
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_index = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_index + 2) / 5 + 1;
+    let month = if month_index < 10 {
+        month_index + 3
+    } else {
+        month_index - 9
+    };
+    let year = year_of_era + era * 400 + i64::from(month <= 2);
+    (year, month as u32, day as u32)
+}
+
+/// `seconds.fraction` as whole nanoseconds. Read as decimal text rather than
+/// through an `f64`, which holds about sixteen digits and an epoch with nine
+/// fractional ones needs nineteen.
+fn nanoseconds(value: &str) -> Option<i128> {
+    let (negative, digits) = match value.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, value),
+    };
+    let (whole, fraction) = digits.split_once('.').unwrap_or((digits, ""));
+    if fraction.len() > 9 {
+        return None;
+    }
+    let whole: i128 = whole.parse().ok()?;
+    let fraction: i128 = format!("{fraction:0<9}").parse().ok()?;
+    let magnitude = whole * 1_000_000_000 + fraction;
+    Some(if negative { -magnitude } else { magnitude })
+}
+
+/// `HH:MM:SS` and as many fractional digits as the column declares.
+fn clock(nanos_of_day: i128, scale: u32) -> String {
+    let seconds = nanos_of_day / 1_000_000_000;
+    let mut text = format!(
+        "{:02}:{:02}:{:02}",
+        seconds / 3_600,
+        seconds / 60 % 60,
+        seconds % 60
+    );
+    if scale > 0 {
+        let fraction = format!("{:09}", nanos_of_day % 1_000_000_000);
+        text.push('.');
+        text.push_str(&fraction[..scale.min(9) as usize]);
+    }
+    text
+}
+
+fn date_and_clock(nanos: i128, scale: u32) -> String {
+    const DAY: i128 = 86_400 * 1_000_000_000;
+    let (year, month, day) = civil_date(nanos.div_euclid(DAY) as i64);
+    format!(
+        "{year:04}-{month:02}-{day:02} {}",
+        clock(nanos.rem_euclid(DAY), scale)
+    )
+}
+
+/// A cell as text a person can read.
+///
+/// Most values arrive that way already. The temporal ones arrive as counts
+/// from the epoch whatever output format the session asks for, so they are
+/// rendered here -- the grid is never shown a number of days and left to guess
+/// (hard rule 4). A value that is not the shape its type promises is passed
+/// through as it came rather than dropped: wrong-looking beats missing.
+fn render(value: &str, row_type: &RowType) -> String {
+    let scale = row_type.scale.unwrap_or(9);
+    let rendered = match row_type.kind.as_str() {
+        "date" => value.parse().ok().map(|days| {
+            let (year, month, day) = civil_date(days);
+            format!("{year:04}-{month:02}-{day:02}")
+        }),
+        "time" => nanoseconds(value).map(|nanos| clock(nanos, scale)),
+        "timestamp_ntz" => nanoseconds(value).map(|nanos| date_and_clock(nanos, scale)),
+        // An instant, and the API carries no session time zone to show it in,
+        // so it is shown in the one zone that needs none and says so.
+        "timestamp_ltz" => {
+            nanoseconds(value).map(|nanos| format!("{}Z", date_and_clock(nanos, scale)))
+        }
+        // The instant in UTC, then the zone's offset in minutes, biased by a
+        // day so that it is never negative on the wire.
+        "timestamp_tz" => value.split_once(' ').and_then(|(instant, offset)| {
+            let offset = offset.parse::<i128>().ok()? - 1_440;
+            let local = nanoseconds(instant)? + offset * 60 * 1_000_000_000;
+            Some(format!(
+                "{} {}{:02}:{:02}",
+                date_and_clock(local, scale),
+                if offset < 0 { '-' } else { '+' },
+                offset.abs() / 60,
+                offset.abs() % 60
+            ))
+        }),
+        _ => None,
+    };
+    rendered.unwrap_or_else(|| value.to_string())
+}
+
+/// What one request holds besides the statement. Blank fields are left out
+/// rather than sent empty, so the user's own defaults stay in force.
+///
+/// Everything here is a field of the request and none of it is SQL: the
+/// statement goes out exactly as it was written (hard rule 1).
+fn request_body(config: &SnowflakeConfig, sql: &str) -> Value {
+    let mut body = json!({
+        "statement": sql,
+        "database": config.database,
+        // Without this the API refuses any submission holding more than one
+        // statement, which every other engine here accepts. Zero is "however
+        // many there are".
+        "parameters": { "MULTI_STATEMENT_COUNT": "0" },
+    });
+    for (field, value) in [("warehouse", &config.warehouse), ("role", &config.role)] {
+        if let Some(value) = value.as_deref().filter(|value| !value.is_empty()) {
+            body[field] = json!(value);
+        }
+    }
+    if config.statement_timeout > 0 {
+        body["timeout"] = json!(config.statement_timeout);
+    }
+    body
+}
+
+/// What a status code and its body add up to.
+#[derive(Debug, PartialEq)]
+enum Reply {
+    /// Accepted and still going: ask again.
+    Running,
+    Finished,
+}
+
+/// The server's own words where it sent any, and the status where it did not
+/// -- a proxy's HTML error page has no `message` to quote (hard rule 6).
+fn reply(host: &str, status: u16, body: &Value) -> Result<Reply, DbError> {
+    match status {
+        200 => Ok(Reply::Finished),
+        202 => Ok(Reply::Running),
+        _ => Err(plain_error(match body["message"].as_str() {
+            Some(message) => message.to_string(),
+            None => format!("{host} answered HTTP {status}."),
+        })),
+    }
+}
+
+/// The statement whose rows a finished response stands for.
+///
+/// A submission of several statements answers with a handle per statement and
+/// a placeholder result of its own; the one shown is the last, as it is for a
+/// multi-statement submission on every other engine.
+fn last_child(body: &Value) -> Option<&str> {
+    body["statementHandles"].as_array()?.last()?.as_str()
+}
+
+fn row_types(body: &Value) -> Result<Vec<RowType>, DbError> {
+    serde_json::from_value(body["resultSetMetaData"]["rowType"].clone()).map_err(|error| {
+        plain_error(format!(
+            "The result's column description was not understood: {error}."
+        ))
+    })
+}
+
+/// A response with no partition list has the one it arrived in.
+fn partition_count(body: &Value) -> usize {
+    body["resultSetMetaData"]["partitionInfo"]
+        .as_array()
+        .map_or(1, Vec::len)
+}
+
+/// One partition's rows, rendered. A JSON `null` is SQL NULL and stays
+/// distinct from the empty string.
+fn rows(body: &Value, row_types: &[RowType]) -> Vec<Vec<Cell>> {
+    let Some(data) = body["data"].as_array() else {
+        return Vec::new();
+    };
+    data.iter()
+        .filter_map(Value::as_array)
+        .map(|row| {
+            row.iter()
+                .zip(row_types)
+                .map(|(cell, row_type)| cell.as_str().map(|value| render(value, row_type)))
+                .collect()
+        })
+        .collect()
+}
+
+/// The rows a write touched, where the response counts them. A `SELECT`
+/// carries no such counts and answers `None`.
+fn rows_affected(body: &Value) -> Option<u64> {
+    let stats = body["stats"].as_object()?;
+    Some(
+        [
+            "numRowsInserted",
+            "numRowsUpdated",
+            "numRowsDeleted",
+            "numDuplicateRowsUpdated",
+        ]
+        .iter()
+        .filter_map(|field| stats.get(*field)?.as_u64())
+        .sum(),
+    )
+}
+
+/// A connection in name only: there is no socket to keep, so this is the
+/// profile's settings, a client, and the statements it has in flight.
+///
+/// No mutex around it, unlike its three siblings, because there is nothing to
+/// serialise -- a catalog load does not queue behind a slow query here.
+#[derive(Clone)]
+pub struct Connection {
+    config: Arc<SnowflakeConfig>,
+    agent: ureq::Agent,
+    /// Handles of statements submitted and not yet finished, which is what
+    /// [`Connection::cancel`] stops. Locked for a push, a removal or a clone
+    /// and never across a request, so cancel waits on nothing a query holds.
+    running: Arc<Mutex<Vec<String>>>,
+}
+
+/// Takes a handle back out of the running list however `query` leaves.
+struct RunningGuard<'a> {
+    running: &'a Mutex<Vec<String>>,
+    handle: String,
+}
+
+impl Drop for RunningGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut running) = self.running.lock() {
+            running.retain(|handle| *handle != self.handle);
+        }
+    }
+}
+
+impl Connection {
+    pub fn open(config: &SnowflakeConfig) -> Result<Self, DbError> {
+        let agent = ureq::Agent::config_builder()
+            // A 422 is the server explaining a SQL error, and the explanation
+            // is in the body ureq would otherwise discard.
+            .http_status_as_error(false)
+            .timeout_connect(Some(Duration::from_secs(30)))
+            // Bounds a server that accepts and then says nothing. Not a bound
+            // on the statement: that is polled, a short request at a time.
+            .timeout_recv_response(Some(Duration::from_secs(120)))
+            .user_agent(concat!("dbdelve/", env!("CARGO_PKG_VERSION")))
+            .build()
+            .into();
+        let connection = Self {
+            config: Arc::new(config.clone()),
+            agent,
+            running: Arc::default(),
+        };
+        // Connecting is the connection test. This needs no warehouse, so it
+        // proves the key, the account and the network without starting one.
+        connection.query("SELECT CURRENT_VERSION()")?;
+        Ok(connection)
+    }
+
+    fn url(&self, path: &str) -> String {
+        format!("https://{}/api/v2/statements{path}", self.config.host())
+    }
+
+    /// One exchange: a fresh token, the request, and the body as JSON whatever
+    /// the status was.
+    fn exchange(&self, url: &str, body: Option<&Value>) -> Result<(u16, Value), DbError> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |since| since.as_secs());
+        let authorization = format!("Bearer {}", token(&self.config, now)?);
+        let headers = [
+            ("Authorization", authorization.as_str()),
+            ("X-Snowflake-Authorization-Token-Type", "KEYPAIR_JWT"),
+            ("Accept", "application/json"),
+        ];
+
+        let sent = match body {
+            Some(body) => {
+                let mut request = self.agent.post(url);
+                for (name, value) in headers {
+                    request = request.header(name, value);
+                }
+                request.send_json(body)
+            }
+            None => {
+                let mut request = self.agent.get(url);
+                for (name, value) in headers {
+                    request = request.header(name, value);
+                }
+                request.call()
+            }
+        };
+        let host = self.config.host();
+        let mut response =
+            sent.map_err(|error| plain_error(format!("{host} was not reached: {error}.")))?;
+        let status = response.status().as_u16();
+        // No size limit: a partition is as large as the server made it, and
+        // the default cap is smaller than one.
+        let body = response
+            .body_mut()
+            .with_config()
+            .limit(u64::MAX)
+            .read_json()
+            .unwrap_or(Value::Null);
+        Ok((status, body))
+    }
+
+    /// Run one submission verbatim and return its last result.
+    ///
+    /// Submitted asynchronously, always: a synchronous submit does not give up
+    /// its handle until the statement ends or 45 seconds pass, and the handle
+    /// is what Cancel needs from the first moment.
+    pub fn query(&self, sql: &str) -> Result<QueryResult, DbError> {
+        let started = Instant::now();
+        let host = self.config.host();
+
+        let (status, accepted) = self.exchange(
+            &self.url("?async=true"),
+            Some(&request_body(&self.config, sql)),
+        )?;
+        reply(&host, status, &accepted)?;
+        let handle = accepted["statementHandle"]
+            .as_str()
+            .ok_or_else(|| {
+                plain_error(format!("{host} accepted a statement and named no handle."))
+            })?
+            .to_string();
+        if let Ok(mut running) = self.running.lock() {
+            running.push(handle.clone());
+        }
+        let _running = RunningGuard {
+            running: &self.running,
+            handle: handle.clone(),
+        };
+
+        let mut pause = Duration::from_millis(100);
+        let mut finished = loop {
+            let (status, body) = self.exchange(&self.url(&format!("/{handle}")), None)?;
+            if reply(&host, status, &body)? == Reply::Finished {
+                break body;
+            }
+            std::thread::sleep(pause);
+            pause = (pause * 2).min(Duration::from_secs(2));
+        };
+
+        let mut handle = handle;
+        if let Some(child) = last_child(&finished).map(str::to_string) {
+            let (status, body) = self.exchange(&self.url(&format!("/{child}")), None)?;
+            reply(&host, status, &body)?;
+            finished = body;
+            handle = child;
+        }
+
+        let row_types = row_types(&finished)?;
+        let mut result = QueryResult {
+            columns: row_types
+                .iter()
+                .map(|row_type| Column {
+                    name: row_type.name.clone(),
+                    data_type: Some(data_type(row_type)),
+                })
+                .collect(),
+            rows: rows(&finished, &row_types),
+            rows_affected: rows_affected(&finished),
+            ..Default::default()
+        };
+        // The whole result is fetched before any of it is shown, which is the
+        // ceiling the Postgres path has too.
+        for partition in 1..partition_count(&finished) {
+            let (status, body) =
+                self.exchange(&self.url(&format!("/{handle}?partition={partition}")), None)?;
+            reply(&host, status, &body)?;
+            result.rows.extend(rows(&body, &row_types));
+        }
+
+        result.bytes = result
+            .rows
+            .iter()
+            .flatten()
+            .flatten()
+            .map(String::len)
+            .sum();
+        result.elapsed = started.elapsed();
+        Ok(result)
+    }
+
+    /// Stop every statement this connection has in flight.
+    ///
+    /// The running statement ends as an ordinary error out of `query`, in the
+    /// server's words. Nothing in flight is not an error.
+    pub fn cancel(&self) -> Result<(), DbError> {
+        let handles = self
+            .running
+            .lock()
+            .map(|running| running.clone())
+            .unwrap_or_default();
+        let host = self.config.host();
+        for handle in handles {
+            let (status, body) =
+                self.exchange(&self.url(&format!("/{handle}/cancel")), Some(&json!({})))?;
+            reply(&host, status, &body)?;
+        }
+        Ok(())
+    }
+
+    pub fn catalog(&self) -> Result<Catalog, DbError> {
+        Err(plain_error(
+            "This build does not read a Snowflake catalog yet.".to_string(),
+        ))
+    }
+
+    pub fn structure(&self, _schema: &str, _relation: &str) -> Result<Structure, DbError> {
+        Err(plain_error(
+            "This build does not read a Snowflake relation's structure yet.".to_string(),
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Throwaway keys that protect nothing, generated for these tests with
+    /// `openssl genpkey -algorithm RSA`.
+    fn test_key(name: &str) -> String {
+        format!("{}/dev/snowflake/{name}", env!("CARGO_MANIFEST_DIR"))
+    }
+
+    fn config(key: &str) -> SnowflakeConfig {
+        SnowflakeConfig {
+            account: "myorg-myaccount".into(),
+            user: "tim".into(),
+            private_key: test_key(key),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn the_fingerprint_is_the_one_openssl_computes() {
+        // The expected values are from
+        //   openssl rsa -in KEY -pubout -outform DER \
+        //     | openssl dgst -sha256 -binary | openssl enc -base64
+        // which is the command Snowflake's own documentation gives, so this is
+        // checked against the server's arithmetic and not against our own.
+        let key = key_pair(&test_key("test-key-2048.p8")).expect("the key loads");
+        assert_eq!(
+            fingerprint(&key),
+            "SHA256:4/76NAyPR/D6nlGOKDw+h7DNn+cNUUuXMPNDC7pyVXs="
+        );
+        // Twice the size pushes both DER lengths past 255, into two bytes.
+        let key = key_pair(&test_key("test-key-4096.p8")).expect("the key loads");
+        assert_eq!(
+            fingerprint(&key),
+            "SHA256:cGqHm+uApyCk8eJ2AGO6ZdmR9wGFHHouRS3w/eFRGgQ="
+        );
+    }
+
+    #[test]
+    fn a_der_length_takes_the_long_form_past_127() {
+        assert_eq!(der_length(0x7f), [0x7f]);
+        assert_eq!(der_length(0x80), [0x81, 0x80]);
+        assert_eq!(der_length(0x0126), [0x82, 0x01, 0x26]);
+    }
+
+    fn claims(token: &str) -> serde_json::Value {
+        let payload = token.split('.').nth(1).expect("three parts");
+        serde_json::from_slice(&URL_SAFE_NO_PAD.decode(payload).expect("base64url"))
+            .expect("claims are JSON")
+    }
+
+    #[test]
+    fn the_claims_name_the_account_and_user_in_upper_case() {
+        let token = token(&config("test-key-2048.p8"), 1_700_000_000).expect("signed");
+        let claims = claims(&token);
+        assert_eq!(claims["sub"], "MYORG-MYACCOUNT.TIM");
+        assert_eq!(
+            claims["iss"],
+            "MYORG-MYACCOUNT.TIM.SHA256:4/76NAyPR/D6nlGOKDw+h7DNn+cNUUuXMPNDC7pyVXs="
+        );
+        assert_eq!(claims["iat"], 1_700_000_000_u64);
+        assert_eq!(claims["exp"], 1_700_000_000_u64 + 59 * 60);
+    }
+
+    #[test]
+    fn a_legacy_locator_loses_its_region_in_the_token() {
+        // `xy12345.eu-central-1` is a host prefix; the account it names is the
+        // part before the dot, and a token naming the whole of it is refused.
+        let mut config = config("test-key-2048.p8");
+        config.account = "xy12345.eu-central-1".into();
+        let token = token(&config, 0).expect("signed");
+        assert_eq!(claims(&token)["sub"], "XY12345.TIM");
+    }
+
+    #[test]
+    fn the_signature_verifies_against_the_public_key() {
+        let token = token(&config("test-key-2048.p8"), 0).expect("signed");
+        let (message, signature) = token.rsplit_once('.').expect("three parts");
+        let key = key_pair(&test_key("test-key-2048.p8")).expect("the key loads");
+        ring::signature::UnparsedPublicKey::new(
+            &ring::signature::RSA_PKCS1_2048_8192_SHA256,
+            key.public_key().as_ref(),
+        )
+        .verify(
+            message.as_bytes(),
+            &URL_SAFE_NO_PAD.decode(signature).expect("base64url"),
+        )
+        .expect("the signature is over the header and claims");
+    }
+
+    #[test]
+    fn an_encrypted_key_is_refused_by_name() {
+        let error = token(&config("test-key-encrypted.p8"), 0).expect_err("refused");
+        assert!(error.message.ends_with("is encrypted."), "{error}");
+        assert!(error.message.contains("test-key-encrypted.p8"), "{error}");
+    }
+
+    #[test]
+    fn a_missing_key_names_its_path() {
+        let error = token(&config("no-such-key.p8"), 0).expect_err("refused");
+        assert!(error.message.contains("no-such-key.p8"), "{error}");
+    }
+
+    fn column(kind: &str, scale: Option<u32>) -> RowType {
+        RowType {
+            name: "c".into(),
+            kind: kind.into(),
+            precision: None,
+            scale,
+        }
+    }
+
+    #[test]
+    fn a_date_is_days_either_side_of_the_epoch() {
+        let date = column("date", None);
+        assert_eq!(render("0", &date), "1970-01-01");
+        assert_eq!(render("-1", &date), "1969-12-31");
+        assert_eq!(render("19000", &date), "2022-01-08");
+        // A leap day, and the day the 400-year rule keeps.
+        assert_eq!(render("19782", &date), "2024-02-29");
+        assert_eq!(render("11016", &date), "2000-02-29");
+    }
+
+    #[test]
+    fn a_time_keeps_as_many_digits_as_its_column_declares() {
+        assert_eq!(
+            render("82919.123456789", &column("time", Some(9))),
+            "23:01:59.123456789"
+        );
+        assert_eq!(
+            render("82919.123000000", &column("time", Some(3))),
+            "23:01:59.123"
+        );
+        assert_eq!(
+            render("82919.000000000", &column("time", Some(0))),
+            "23:01:59"
+        );
+    }
+
+    #[test]
+    fn a_timestamp_without_a_zone_renders_without_one() {
+        assert_eq!(
+            render("1616173619.000000000", &column("timestamp_ntz", Some(0))),
+            "2021-03-19 17:06:59"
+        );
+        assert_eq!(
+            render("1616173619.250000000", &column("timestamp_ltz", Some(3))),
+            "2021-03-19 17:06:59.250Z"
+        );
+    }
+
+    #[test]
+    fn an_instant_before_the_epoch_keeps_its_fraction_the_right_way_round() {
+        // Half a second before midnight, not half a second after the second
+        // before it: the fraction of a negative count points backwards.
+        assert_eq!(
+            render("-0.500000000", &column("timestamp_ntz", Some(3))),
+            "1969-12-31 23:59:59.500"
+        );
+        assert_eq!(
+            render("-86400.000000000", &column("timestamp_ntz", Some(0))),
+            "1969-12-31 00:00:00"
+        );
+    }
+
+    #[test]
+    fn a_zoned_timestamp_is_shown_at_its_own_offset() {
+        // 1440 is the bias, so 1560 is +02:00 and 1140 is -05:00.
+        let zoned = column("timestamp_tz", Some(0));
+        assert_eq!(
+            render("1616173619.000000000 1560", &zoned),
+            "2021-03-19 19:06:59 +02:00"
+        );
+        assert_eq!(
+            render("1616173619.000000000 1140", &zoned),
+            "2021-03-19 12:06:59 -05:00"
+        );
+        assert_eq!(
+            render("1616173619.000000000 1770", &zoned),
+            "2021-03-19 22:36:59 +05:30"
+        );
+    }
+
+    #[test]
+    fn a_value_that_is_not_the_promised_shape_is_shown_as_it_came() {
+        assert_eq!(render("not-a-day", &column("date", None)), "not-a-day");
+        assert_eq!(render("12.5", &column("fixed", Some(1))), "12.5");
+        assert_eq!(render("{\"a\":1}", &column("variant", None)), "{\"a\":1}");
+    }
+
+    #[test]
+    fn a_type_is_spelled_the_way_its_sql_spells_it() {
+        let fixed = RowType {
+            precision: Some(38),
+            scale: Some(0),
+            ..column("fixed", None)
+        };
+        assert_eq!(data_type(&fixed), "number(38,0)");
+        assert_eq!(data_type(&column("real", None)), "float");
+        assert_eq!(data_type(&column("text", None)), "varchar");
+        assert_eq!(data_type(&column("timestamp_tz", Some(9))), "timestamp_tz");
+        // The grid right-aligns on these names, so they have to be ones
+        // `is_numeric_type` already answers to.
+        assert!(super::super::is_numeric_type(&data_type(&fixed)));
+        assert!(super::super::is_numeric_type("float"));
+    }
+
+    fn body(text: &str) -> Value {
+        serde_json::from_str(text).expect("the fixture is JSON")
+    }
+
+    #[test]
+    fn the_statement_is_sent_exactly_as_written() {
+        // Odd spacing, a trailing comment and no semicolon: none of it is
+        // dbdelve's to tidy.
+        let sql = "select  1 -- one\n  ,2";
+        assert_eq!(request_body(&config("k"), sql)["statement"], sql);
+    }
+
+    #[test]
+    fn a_request_leaves_out_what_the_profile_left_blank() {
+        let mut config = config("k");
+        config.database = "ANALYTICS".into();
+        config.warehouse = Some(String::new());
+        let blank = request_body(&config, "select 1");
+        assert_eq!(blank["database"], "ANALYTICS");
+        assert_eq!(blank["parameters"]["MULTI_STATEMENT_COUNT"], "0");
+        for absent in ["warehouse", "role", "timeout"] {
+            assert!(blank.get(absent).is_none(), "{absent} was sent");
+        }
+
+        config.warehouse = Some("COMPUTE_WH".into());
+        config.role = Some("ANALYST".into());
+        config.statement_timeout = 30;
+        let filled = request_body(&config, "select 1");
+        assert_eq!(filled["warehouse"], "COMPUTE_WH");
+        assert_eq!(filled["role"], "ANALYST");
+        assert_eq!(filled["timeout"], 30);
+    }
+
+    #[test]
+    fn a_result_becomes_rendered_rows_and_named_types() {
+        let finished = body(
+            r#"{
+                "resultSetMetaData": {
+                    "numRows": 2,
+                    "rowType": [
+                        {"name": "ID", "type": "fixed", "precision": 38, "scale": 0, "nullable": false},
+                        {"name": "NOTE", "type": "text", "length": 16777216, "nullable": true},
+                        {"name": "SEEN", "type": "date", "nullable": true}
+                    ],
+                    "partitionInfo": [{"rowCount": 2}, {"rowCount": 9}]
+                },
+                "data": [["1", "", "19000"], ["2", null, null]],
+                "statementHandle": "01b0-aaaa"
+            }"#,
+        );
+        let types = row_types(&finished).expect("described");
+        assert_eq!(
+            types.iter().map(data_type).collect::<Vec<_>>(),
+            ["number(38,0)", "varchar", "date"]
+        );
+        // NULL and the empty string are different answers and stay different.
+        assert_eq!(
+            rows(&finished, &types),
+            vec![
+                vec![
+                    Some("1".into()),
+                    Some(String::new()),
+                    Some("2022-01-08".into())
+                ],
+                vec![Some("2".into()), None, None],
+            ]
+        );
+        assert_eq!(partition_count(&finished), 2);
+        assert_eq!(last_child(&finished), None);
+        assert_eq!(rows_affected(&finished), None);
+    }
+
+    #[test]
+    fn several_statements_answer_with_the_last_ones_handle() {
+        let finished = body(r#"{"statementHandles": ["01b0-aaaa", "01b0-bbbb"]}"#);
+        assert_eq!(last_child(&finished), Some("01b0-bbbb"));
+    }
+
+    #[test]
+    fn a_write_reports_the_rows_it_touched() {
+        let finished =
+            body(r#"{"stats": {"numRowsInserted": 3, "numRowsUpdated": 0, "numRowsDeleted": 1}}"#);
+        assert_eq!(rows_affected(&finished), Some(4));
+    }
+
+    #[test]
+    fn a_status_is_running_finished_or_the_servers_own_words() {
+        let host = "myorg-myaccount.snowflakecomputing.com";
+        assert_eq!(reply(host, 200, &Value::Null), Ok(Reply::Finished));
+        assert_eq!(reply(host, 202, &Value::Null), Ok(Reply::Running));
+
+        // A SQL error and a rejected token both explain themselves.
+        let refused = body(
+            r#"{"code": "001003", "sqlState": "42000",
+                "message": "SQL compilation error:\nsyntax error line 1 at position 7 unexpected 'FORM'."}"#,
+        );
+        assert_eq!(
+            reply(host, 422, &refused).expect_err("an error").message,
+            "SQL compilation error:\nsyntax error line 1 at position 7 unexpected 'FORM'."
+        );
+        let unauthorised = body(r#"{"code": "390144", "message": "JWT token is invalid."}"#);
+        assert_eq!(
+            reply(host, 401, &unauthorised)
+                .expect_err("an error")
+                .message,
+            "JWT token is invalid."
+        );
+        // Something that is not the API -- a proxy, a wrong host -- has no
+        // message, so what happened is all there is to say.
+        assert_eq!(
+            reply(host, 403, &Value::Null)
+                .expect_err("an error")
+                .message,
+            "myorg-myaccount.snowflakecomputing.com answered HTTP 403."
+        );
+    }
+
+    #[test]
+    fn a_handle_leaves_the_running_list_however_the_query_ends() {
+        let running = Mutex::new(vec!["other".to_string()]);
+        let attempt = || -> Result<(), DbError> {
+            running.lock().expect("unpoisoned").push("mine".into());
+            let _guard = RunningGuard {
+                running: &running,
+                handle: "mine".into(),
+            };
+            Err(plain_error("the poll failed".into()))
+        };
+        assert!(attempt().is_err());
+        assert_eq!(*running.lock().expect("unpoisoned"), ["other"]);
+    }
+
+    #[test]
+    #[ignore = "requires a network"]
+    fn live_an_account_that_does_not_exist_is_an_error_in_words() {
+        // Needs no account, which is the point: it is the one live check that
+        // runs anywhere, and what it pins is that the TLS provider is there at
+        // run time -- a missing one panics rather than failing the connect.
+        let mut config = config("test-key-2048.p8");
+        config.account = "dbdelve-no-such-account".into();
+        let error = Connection::open(&config).err().expect("nobody is there");
+        println!("{error}");
+        assert!(!error.message.is_empty());
+    }
+
+    const LIVE: &str = "requires a Snowflake account configured through DBDELVE_SNOWFLAKE_*";
+
+    /// ACCOUNT, USER, PRIVATE_KEY and DATABASE are required; WAREHOUSE, ROLE
+    /// and HOST are taken when set.
+    fn live_config() -> SnowflakeConfig {
+        let required = |name: &str| {
+            std::env::var(format!("DBDELVE_SNOWFLAKE_{name}")).unwrap_or_else(|_| panic!("{LIVE}"))
+        };
+        let optional = |name: &str| std::env::var(format!("DBDELVE_SNOWFLAKE_{name}")).ok();
+        SnowflakeConfig {
+            account: required("ACCOUNT"),
+            host: optional("HOST"),
+            user: required("USER"),
+            private_key: required("PRIVATE_KEY"),
+            database: required("DATABASE"),
+            warehouse: optional("WAREHOUSE"),
+            role: optional("ROLE"),
+            statement_timeout: 0,
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a Snowflake account configured through DBDELVE_SNOWFLAKE_*"]
+    fn live_query_round_trip() {
+        let connection = Connection::open(&live_config()).expect("connects");
+        let result = connection
+            .query("SELECT 1 AS one, NULL AS nothing, '' AS blank, DATE '2024-02-29' AS leap")
+            .expect("runs");
+        assert_eq!(
+            result
+                .columns
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect::<Vec<_>>(),
+            ["ONE", "NOTHING", "BLANK", "LEAP"]
+        );
+        assert_eq!(
+            result.rows,
+            vec![vec![
+                Some("1".into()),
+                None,
+                Some(String::new()),
+                Some("2024-02-29".into())
+            ]]
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a Snowflake account configured through DBDELVE_SNOWFLAKE_*"]
+    fn live_every_temporal_type_renders_as_the_server_would_print_it() {
+        // The wire forms in `render` are from the API's documentation; this is
+        // the server agreeing with them, compared against its own TO_VARCHAR.
+        let connection = Connection::open(&live_config()).expect("connects");
+        let result = connection
+            .query(
+                "SELECT '2021-03-19 17:06:59.250'::TIMESTAMP_NTZ(3), \
+                        '2021-03-19 17:06:59 +05:30'::TIMESTAMP_TZ(0), \
+                        '23:01:59.123'::TIME(3), \
+                        '1969-12-31 23:59:59.500'::TIMESTAMP_NTZ(3)",
+            )
+            .expect("runs");
+        assert_eq!(
+            result.rows[0],
+            vec![
+                Some("2021-03-19 17:06:59.250".to_string()),
+                Some("2021-03-19 17:06:59 +05:30".to_string()),
+                Some("23:01:59.123".to_string()),
+                Some("1969-12-31 23:59:59.500".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a Snowflake account configured through DBDELVE_SNOWFLAKE_*"]
+    fn live_several_statements_return_the_last_result() {
+        let connection = Connection::open(&live_config()).expect("connects");
+        let result = connection.query("SELECT 1; SELECT 2 AS two").expect("runs");
+        assert_eq!(result.rows, vec![vec![Some("2".into())]]);
+    }
+
+    #[test]
+    #[ignore = "requires a Snowflake account configured through DBDELVE_SNOWFLAKE_*"]
+    fn live_a_large_result_arrives_whole_across_partitions() {
+        let connection = Connection::open(&live_config()).expect("connects");
+        let result = connection
+            .query("SELECT SEQ4(), RANDSTR(64, RANDOM()) FROM TABLE(GENERATOR(ROWCOUNT => 200000))")
+            .expect("runs");
+        assert_eq!(result.rows.len(), 200_000);
+    }
+
+    #[test]
+    #[ignore = "requires a Snowflake account configured through DBDELVE_SNOWFLAKE_*"]
+    fn live_cancel_stops_a_running_statement() {
+        let connection = Connection::open(&live_config()).expect("connects");
+        let waiting = connection.clone();
+        let started = Instant::now();
+        let query = std::thread::spawn(move || waiting.query("CALL SYSTEM$WAIT(60)"));
+        // Long enough for the submit to have returned its handle.
+        std::thread::sleep(Duration::from_secs(3));
+        connection.cancel().expect("the cancel is accepted");
+        let error = query.join().expect("no panic").expect_err("stopped");
+        println!("{error}");
+        assert!(started.elapsed() < Duration::from_secs(30));
+    }
+
+    #[test]
+    #[ignore = "requires a Snowflake account configured through DBDELVE_SNOWFLAKE_*"]
+    fn live_a_statement_timeout_stops_a_statement() {
+        let mut config = live_config();
+        config.statement_timeout = 3;
+        let connection = Connection::open(&config).expect("connects");
+        let started = Instant::now();
+        let error = connection
+            .query("CALL SYSTEM$WAIT(60)")
+            .expect_err("stopped");
+        println!("{error}");
+        assert!(started.elapsed() < Duration::from_secs(30));
+    }
+
+    #[test]
+    #[ignore = "requires a Snowflake account configured through DBDELVE_SNOWFLAKE_*"]
+    fn live_a_use_does_not_reach_the_next_run() {
+        // The statelessness the module header describes, pinned: if this ever
+        // fails the API has grown a session and the documentation is wrong.
+        let connection = Connection::open(&live_config()).expect("connects");
+        connection
+            .query("USE SCHEMA INFORMATION_SCHEMA")
+            .expect("runs");
+        let result = connection.query("SELECT CURRENT_SCHEMA()").expect("runs");
+        assert_ne!(result.rows[0][0].as_deref(), Some("INFORMATION_SCHEMA"));
     }
 }
