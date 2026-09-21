@@ -51,6 +51,8 @@ const CHAR_WIDTH: f32 = 7.8;
 /// Room for the sort control that rides at the trailing edge of a header, so a
 /// column sized to its own name still shows the whole name.
 const HEADER_CONTROL_WIDTH: f32 = 20.0;
+/// The follow arrow's box: a target, where the glyph alone was twelve pixels.
+const FOLLOW_BUTTON: f32 = 18.0;
 
 const MIN_COLUMN_WIDTH: f32 = 56.0;
 const MAX_COLUMN_WIDTH: f32 = 480.0;
@@ -1099,9 +1101,9 @@ impl TableDelegate for ResultGrid {
         window: &mut Window,
         cx: &mut Context<TableState<Self>>,
     ) -> impl IntoElement {
-        let (text, faint, edited_bg, active_ring) = {
+        let (text, faint, edited_bg, active_ring, hover_bg) = {
             let t = theme(cx);
-            (t.text, t.text_faint, t.edited, t.accent)
+            (t.text, t.text_faint, t.edited, t.accent, t.element_hover)
         };
         let base = div()
             .id(("cell", row_ix * self.columns.len() + col_ix))
@@ -1228,24 +1230,49 @@ impl TableDelegate for ResultGrid {
             // Italic so a NULL cannot be mistaken for the four-letter string.
             .when(cell.is_none(), |cell| cell.italic())
             .when(pending.is_some(), |cell| cell.bg(edited_bg))
-            .child(cell.unwrap_or(keyword))
+            // Beside an arrow the value is the child that gives way. Bare text
+            // in a row does not shrink, so a value as wide as its column --
+            // every cell of a column of 32-character keys -- pushed the arrow
+            // past the clipped edge, where it could be neither seen nor found.
+            .map(|this| {
+                let value = cell.unwrap_or(keyword);
+                match group.is_some() {
+                    true => this.child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .when(self.is_numeric(col_ix), |value| value.text_right())
+                            .child(value),
+                    ),
+                    false => this.child(value),
+                }
+            })
             // The workspace owns the statement and the tabs and the grid owns
             // neither, so this leaves exactly as a header's sort click does.
             .when_some(group.clone(), |cell, group| cell.group(group))
             .children(group.map(|group| {
                 div()
                     .id(("follow-key", row_ix * self.columns.len() + col_ix))
-                    .ml_auto()
+                    // A fixed box at the cell's right edge rather than a glyph
+                    // trailing the text: somewhere to aim, in the same place
+                    // in every row.
+                    .ml(px(layout::SPACE_XS))
                     .flex_shrink_0()
+                    .size(px(FOLLOW_BUTTON))
+                    .rounded(px(4.))
                     .flex()
                     .items_center()
+                    .justify_center()
                     .text_color(faint)
+                    .hover(|button| button.bg(hover_bg).text_color(text))
                     .when(!active, |hidden| {
                         hidden
                             .opacity(0.)
                             .group_hover(group, |shown| shown.opacity(1.))
                     })
-                    .child(icon(icon::FOLLOW_KEY).size(px(12.)))
+                    .child(icon(icon::FOLLOW_KEY).size(px(14.)))
                     .on_click(cx.listener(move |table, _, window, cx| {
                         // The action follows the active cell, and this one is
                         // only hovered: without the move it would open the row
