@@ -752,26 +752,56 @@ fn collect_statements(tree: &Tree, sql: &str) -> Vec<Range<usize>> {
     let root = tree.root_node();
     let mut cursor = root.walk();
     let mut statements: Vec<Range<usize>> = Vec::new();
+    // Whether a `;` has closed the statement before this node. Read off the
+    // tree's own `;` tokens rather than off the text between nodes, where one
+    // inside a comment would look the same and is not a separator.
+    let mut separated = true;
+    // Whether the last statement began as text the grammar could not read and
+    // has not reached its `;` yet, so what follows is still part of it.
+    let mut unread = false;
 
-    for node in root.named_children(&mut cursor) {
+    for node in root.children(&mut cursor) {
+        if node.kind() == ";" {
+            separated = true;
+            unread = false;
+            continue;
+        }
+
         // Whatever the grammar could not read lands in a sibling ERROR node.
-        // Dropping it would send the statement's head alone, and the head of a
-        // half-typed `DELETE … WHERE` is an unqualified DELETE. The tail was
-        // typed into this statement, so it goes to the server with it and the
-        // server is what explains the problem.
-        //
-        // Backwards only, deliberately. An ERROR *before* a statement means the
-        // statement's opening keyword is the part that did not parse, so what
-        // is left is a fragment the server rejects rather than a statement that
-        // runs and means something else — `GRANT SELECT ON t TO r` sends
-        // `SELECT ON t TO r`. Merging that one forward would attach a typo on
-        // the first line to the perfectly good statement underneath it.
         if node.is_error() {
-            if let Some(last) = statements.last_mut()
-                && let Some(merged) = trim_range(sql, last.start..node.byte_range().end)
-            {
-                *last = merged;
+            // It can swallow the `;` that ends it, which every other range
+            // leaves out -- and then nothing else in the tree says the
+            // statement closed.
+            let text = sql.get(node.byte_range()).unwrap_or_default();
+            let closed = text.trim_end().ends_with(';');
+            let end = node.byte_range().start
+                + text
+                    .trim_end_matches(|c: char| c == ';' || c.is_whitespace())
+                    .len();
+
+            // After a statement with no `;` between, it is that statement's
+            // tail. Dropping it would send the head alone, and the head of a
+            // half-typed `DELETE … WHERE` is an unqualified DELETE. The tail was
+            // typed into this statement, so it goes to the server with it and
+            // the server is what explains the problem.
+            if !separated && let Some(last) = statements.last_mut() {
+                if let Some(merged) = trim_range(sql, last.start..end) {
+                    *last = merged;
+                }
+            // Otherwise it opens a statement of its own. The grammar is one
+            // dialect's worth of SQL and the servers speak four: `SHOW PRIMARY
+            // KEYS`, `CALL`, `USE SCHEMA` and `PRAGMA` are all statements it
+            // has never heard of, and a buffer holding only one of them used to
+            // hold "no statement to run". Whether it is valid is the server's
+            // to say (hard rule 1 cuts both ways: not rewritten, and not
+            // withheld either). `;;;` is unreadable too, and is nothing once
+            // its separators are gone.
+            } else if let Some(range) = trim_range(sql, node.byte_range().start..end) {
+                statements.push(range);
+                unread = true;
             }
+            separated = closed;
+            unread &= !closed;
             continue;
         }
 
@@ -779,8 +809,24 @@ fn collect_statements(tree: &Tree, sql: &str) -> Vec<Range<usize>> {
             continue;
         }
 
+        // The rest of a statement whose opening the grammar could not read:
+        // `GRANT SELECT ON t TO r` parses as an unread `GRANT` and then a
+        // `SELECT ON t`, and sending the second without the first runs a
+        // statement nobody wrote.
+        if unread
+            && !separated
+            && let Some(last) = statements.last_mut()
+        {
+            if let Some(merged) = trim_range(sql, last.start..node.byte_range().end) {
+                *last = merged;
+            }
+            continue;
+        }
+
         if let Some(range) = trim_range(sql, node.byte_range()) {
             statements.push(range);
+            separated = false;
+            unread = false;
         }
     }
 
@@ -1484,6 +1530,49 @@ mod tests {
     fn a_buffer_of_only_comments_has_nothing_to_run() {
         assert!(Buffer::parse("-- only a comment").statement_at(0).is_none());
         assert!(Buffer::parse(";;;").statement_at(0).is_none());
+    }
+
+    #[test]
+    fn a_statement_the_grammar_has_never_heard_of_is_still_one() {
+        // One dialect's grammar, four servers. None of these parse, all of
+        // them are statements, and whether they are valid is the server's say.
+        for sql in [
+            "SHOW PRIMARY KEYS IN TABLE L4.F_LLM_KOSTEN;",
+            "CALL SYSTEM$WAIT(3);",
+            "USE SCHEMA X",
+        ] {
+            let buffer = Buffer::parse(sql);
+            let range = buffer.statement_at(0).unwrap_or_else(|| panic!("{sql}"));
+            assert_eq!(&sql[range], sql.trim_end_matches(';').trim_end(), "{sql}");
+        }
+    }
+
+    #[test]
+    fn an_unread_statement_between_two_others_is_neither_of_them() {
+        // It used to be glued onto the one before it, so running the first
+        // line ran the second as well.
+        assert_eq!(
+            texts("SELECT 1;\nSHOW PRIMARY KEYS IN TABLE L4.F;\nSELECT 2;"),
+            vec!["SELECT 1", "SHOW PRIMARY KEYS IN TABLE L4.F", "SELECT 2"]
+        );
+    }
+
+    #[test]
+    fn a_statement_whose_opening_is_unread_is_sent_whole() {
+        // The grammar reads this as an unknown `GRANT`, a `SELECT ON t`, and an
+        // unknown `TO r`. It is one statement up to its `;`.
+        assert_eq!(
+            texts("GRANT SELECT ON t TO r;\nSELECT 2"),
+            vec!["GRANT SELECT ON t TO r", "SELECT 2"]
+        );
+    }
+
+    #[test]
+    fn a_semicolon_in_a_comment_does_not_cut_a_tail_off_its_statement() {
+        // The hazard the backwards merge exists for: the head of this alone is
+        // an unqualified DELETE.
+        let sql = "DELETE FROM t -- note; still the same statement\n WHERE !!! garbage";
+        assert_eq!(texts(sql), vec![sql]);
     }
 
     #[test]
