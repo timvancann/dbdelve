@@ -405,8 +405,16 @@ fn request_body(config: &SnowflakeConfig, sql: &str) -> Value {
     body
 }
 
+/// Whether a submission has to be stoppable from the moment it is sent, which
+/// is what the extra round trip of an asynchronous submit is for.
+#[derive(Clone, Copy, PartialEq)]
+enum Cancellable {
+    Yes,
+    No,
+}
+
 /// What a status code and its body add up to.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum Reply {
     /// Accepted and still going: ask again.
     Running,
@@ -587,41 +595,71 @@ impl Connection {
 
     /// Run one submission verbatim and return its last result.
     ///
-    /// Submitted asynchronously, always: a synchronous submit does not give up
-    /// its handle until the statement ends or 45 seconds pass, and the handle
-    /// is what Cancel needs from the first moment.
+    /// Submitted asynchronously, which costs a round trip: a synchronous submit
+    /// does not give up its handle until the statement ends or 45 seconds pass,
+    /// and the handle is what Cancel needs from the first moment. Measured at
+    /// 885ms against 315ms for three `SELECT 1`s, and that is the price of the
+    /// button working on the statement that needs it.
     pub fn query(&self, sql: &str) -> Result<QueryResult, DbError> {
+        self.submit(sql, Cancellable::Yes)
+    }
+
+    /// The same, for a statement dbdelve wrote and the user cannot see.
+    ///
+    /// Submitted synchronously: nothing offers to cancel a catalog load, and
+    /// the handle a cancel would need is the only thing the extra round trip
+    /// buys. A structure load is four of these, so it is most of a second each
+    /// time a relation is opened.
+    fn internal_query(&self, sql: &str) -> Result<QueryResult, DbError> {
+        self.submit(sql, Cancellable::No)
+    }
+
+    fn submit(&self, sql: &str, cancellable: Cancellable) -> Result<QueryResult, DbError> {
         let started = Instant::now();
         let host = self.config.host();
+        let body = request_body(&self.config, sql);
 
-        let (status, accepted) = self.exchange(
-            &self.url("?async=true"),
-            Some(&request_body(&self.config, sql)),
-        )?;
-        reply(&host, status, &accepted)?;
-        let handle = accepted["statementHandle"]
-            .as_str()
-            .ok_or_else(|| {
-                plain_error(format!("{host} accepted a statement and named no handle."))
-            })?
-            .to_string();
-        if let Ok(mut running) = self.running.lock() {
-            running.push(handle.clone());
-        }
-        let _running = RunningGuard {
-            running: &self.running,
-            handle: handle.clone(),
+        // A synchronous submit answers with the result itself, and only hands
+        // back a handle when the statement outlives the API's own 45-second
+        // window -- so both paths have to be read here, whichever was asked for.
+        let url = match cancellable {
+            Cancellable::Yes => self.url("?async=true"),
+            Cancellable::No => self.url(""),
         };
-
-        let mut pause = Duration::from_millis(100);
-        let mut finished = loop {
-            let (status, body) = self.exchange(&self.url(&format!("/{handle}")), None)?;
-            if reply(&host, status, &body)? == Reply::Finished {
-                break body;
+        let (status, accepted) = self.exchange(&url, Some(&body))?;
+        let mut answer = reply(&host, status, &accepted)?;
+        let handle = accepted["statementHandle"].as_str().unwrap_or_default();
+        // Nothing to cancel once the statement is over, and a synchronous
+        // submit that finished is over.
+        let _running = (answer == Reply::Running).then(|| {
+            if let Ok(mut running) = self.running.lock() {
+                running.push(handle.to_string());
             }
-            std::thread::sleep(pause);
-            pause = (pause * 2).min(Duration::from_secs(2));
+            RunningGuard {
+                running: &self.running,
+                handle: handle.to_string(),
+            }
+        });
+        let handle = match handle.is_empty() {
+            true if answer == Reply::Running => {
+                return Err(plain_error(format!(
+                    "{host} accepted a statement and named no handle."
+                )));
+            }
+            _ => handle.to_string(),
         };
+
+        let mut finished = accepted;
+        let mut pause = Duration::from_millis(100);
+        while answer == Reply::Running {
+            let (status, body) = self.exchange(&self.url(&format!("/{handle}")), None)?;
+            answer = reply(&host, status, &body)?;
+            finished = body;
+            if answer == Reply::Running {
+                std::thread::sleep(pause);
+                pause = (pause * 2).min(Duration::from_secs(2));
+            }
+        }
 
         let mut handle = handle;
         if let Some(child) = last_child(&finished).map(str::to_string) {
@@ -688,18 +726,12 @@ impl Connection {
     /// Structure tab. That is the price of the idiomatic catalog, and it is
     /// the server's message the user sees when there is no warehouse to run.
     pub fn catalog(&self) -> Result<Catalog, DbError> {
-        assemble_catalog(self.query(RELATIONS_SQL)?, self.query(ROUTINES_SQL)?)
+        let [relations, routines] = self.at_once([RELATIONS_SQL.into(), ROUTINES_SQL.into()])?;
+        assemble_catalog(relations, routines)
     }
 
     pub fn structure(&self, schema: &str, relation: &str) -> Result<Structure, DbError> {
         let literal = |value: &str| Engine::Snowflake.quote_literal(value);
-        let columns = self.query(
-            &COLUMNS_SQL
-                .replace("{schema}", &literal(schema))
-                .replace("{relation}", &literal(relation)),
-        )?;
-        let mut structure =
-            assemble_structure(columns, QueryResult::default(), QueryResult::default())?;
 
         // `INFORMATION_SCHEMA` names a constraint and its type but has no view
         // of the columns in it, so the keys come from `SHOW`.
@@ -716,10 +748,17 @@ impl Connection {
         // one written without it.
         let database = self.config.stored_database();
         let within = Engine::Snowflake.qualified(&database, schema);
-        let primary = self.query(&format!("SHOW PRIMARY KEYS IN SCHEMA {within}"))?;
-        let unique = self.query(&format!("SHOW UNIQUE KEYS IN SCHEMA {within}"))?;
-        let imported = self.query(&format!("SHOW IMPORTED KEYS IN SCHEMA {within}"))?;
+        let [columns, primary, unique, imported] = self.at_once([
+            COLUMNS_SQL
+                .replace("{schema}", &literal(schema))
+                .replace("{relation}", &literal(relation)),
+            format!("SHOW PRIMARY KEYS IN SCHEMA {within}"),
+            format!("SHOW UNIQUE KEYS IN SCHEMA {within}"),
+            format!("SHOW IMPORTED KEYS IN SCHEMA {within}"),
+        ])?;
 
+        let mut structure =
+            assemble_structure(columns, QueryResult::default(), QueryResult::default())?;
         structure.constraints = [
             key_definitions(
                 &primary,
@@ -740,6 +779,41 @@ impl Connection {
         .concat();
         structure.foreign_keys = foreign_keys(&imported, relation, &database);
         Ok(structure)
+    }
+
+    /// Run statements dbdelve wrote all at the same time, in their own order.
+    ///
+    /// One thread each, because there is no connection to serialise them on:
+    /// this engine is an HTTP client and each statement is its own request. It
+    /// is what keeps a structure load at the cost of its slowest statement
+    /// rather than the sum of four, measured at 1.3s against 3.6s.
+    ///
+    /// The first error wins, and by position rather than by whichever thread
+    /// failed first, so the same broken catalog always reports the same way.
+    fn at_once<const N: usize>(
+        &self,
+        statements: [String; N],
+    ) -> Result<[QueryResult; N], DbError> {
+        let mut results: [Result<QueryResult, DbError>; N] =
+            std::array::from_fn(|_| Ok(QueryResult::default()));
+        std::thread::scope(|scope| {
+            let mut threads = Vec::with_capacity(N);
+            for sql in &statements {
+                let connection = self.clone();
+                threads.push(scope.spawn(move || connection.internal_query(sql)));
+            }
+            for (slot, thread) in results.iter_mut().zip(threads) {
+                *slot = thread.join().unwrap_or_else(|_| {
+                    Err(plain_error("A catalog query did not finish.".to_string()))
+                });
+            }
+        });
+
+        let mut done = Vec::with_capacity(N);
+        for result in results {
+            done.push(result?);
+        }
+        Ok(done.try_into().unwrap_or_else(|_| unreachable!()))
     }
 }
 
@@ -1705,5 +1779,29 @@ mod tests {
                 println!("{} on a number column: {error}", operator.slug());
             }
         }
+    }
+
+    #[test]
+    #[ignore = "requires a Snowflake account configured through DBDELVE_SNOWFLAKE_*"]
+    fn live_bench_catalog_and_structure() {
+        let connection = Connection::open(&live_config()).expect("connects");
+        let schema = std::env::var("DBDELVE_SNOWFLAKE_SCHEMA")
+            .unwrap_or_else(|_| "L4_BEDRIJFSVOERING_SERVICES".into());
+        let relation =
+            std::env::var("DBDELVE_SNOWFLAKE_RELATION").unwrap_or_else(|_| "F_LLM_KOSTEN".into());
+
+        let started = Instant::now();
+        let catalog = connection.catalog().expect("catalog");
+        println!(
+            "{:>8?}  catalog(), {} schemas",
+            started.elapsed(),
+            catalog.schemas.len()
+        );
+        let started = Instant::now();
+        connection.structure(&schema, &relation).expect("structure");
+        println!("{:>8?}  structure()", started.elapsed());
+        let started = Instant::now();
+        connection.query("SELECT 1").expect("query");
+        println!("{:>8?}  a user's SELECT 1", started.elapsed());
     }
 }
