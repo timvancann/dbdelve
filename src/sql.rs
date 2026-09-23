@@ -838,6 +838,12 @@ fn collect_statements(tree: &Tree, sql: &str) -> Vec<Range<usize>> {
 /// a `;` inside a string, a quoted name, a comment or a dollar-quoted body
 /// separates nothing: cutting a function body at its first `;` would send the
 /// server half a `CREATE FUNCTION`.
+///
+/// ponytail: standard SQL only. MySQL's `#` line comments and backslash
+/// escapes are not read, so a `;` inside one of those splits a statement the
+/// server then rejects. Reading them would break Postgres, where `#` is an
+/// operator and `\` is not an escape -- the fix is a dialect here, not a
+/// bigger scanner, and it can wait for someone who hits it.
 fn unread_pieces(sql: &str, range: Range<usize>) -> (Vec<Range<usize>>, bool) {
     let text = sql.get(range.clone()).unwrap_or_default();
     let bytes = text.as_bytes();
@@ -880,7 +886,10 @@ fn unread_pieces(sql: &str, range: Range<usize>) -> (Vec<Range<usize>>, bool) {
                     None => 1,
                 }
             }
-            _ => 1,
+            // Byte-wise scan, char-wise slicing: advancing one byte past a
+            // multi-byte character would leave `index` mid-character and the
+            // next `&text[index..]` panics.
+            _ => rest.chars().next().map_or(1, char::len_utf8),
         };
     }
 
@@ -1407,6 +1416,61 @@ pub(crate) fn gate(verdict: &Verdict, mode: Mode, confirmed: &[Destructive]) -> 
         .map(Stop::Confirm)
 }
 
+/// `sql` laid out over several lines: the same tokens, indented. `None` when
+/// the buffer holds a dollar-quoted body, which this cannot reflow safely.
+///
+/// Token-level reformatting rather than a round trip through the `sqlparser`
+/// AST this module already parses with for `classify`. Regenerating a statement
+/// from that AST drops every comment the user wrote and quietly rewrites the
+/// dialect corners sqlparser only half-supports, which is hard rule 1 — dbdelve
+/// never rewrites SQL behind the user's back.
+///
+/// A tokenizer is meant to be unable to do either, and sqlformat is one
+/// everywhere except `$$`: it tokenizes *inside* a dollar-quoted body instead of
+/// carrying it through whole, so `select $$hello   world$$` comes back as
+/// `$$hello world$$` — a different value, not a different layout. Single-quoted
+/// literals are safe. So the rule is refuse, never guess: a buffer holding one
+/// is returned unformatted rather than silently edited.
+//
+// ponytail: refuses the whole buffer over one dollar quote, where splitting on
+// the quoted regions and formatting only the text between them would still
+// format the rest. Worth doing when someone is actually editing plpgsql here.
+//
+// ponytail: `FormatOptions` carries a `dialect`, deliberately left at Generic.
+// Plumbing the connection's real engine through is the upgrade path if the
+// output ever looks wrong for a specific backend.
+pub(crate) fn format(sql: &str) -> Option<String> {
+    if has_dollar_quote(sql) {
+        return None;
+    }
+    Some(sqlformat::format(
+        sql,
+        &sqlformat::QueryParams::default(),
+        &sqlformat::FormatOptions::default(),
+    ))
+}
+
+/// Whether `sql` opens a `$$` or `$tag$` body anywhere.
+///
+/// Deliberately not a parse: it answers "is this text unsafe to reflow", and
+/// erring towards yes only costs a refusal. The tag rule is Postgres's own, and
+/// it is what keeps the `$1` placeholder out -- a tag is empty or starts with a
+/// letter, so `$1` never reads as an opening quote.
+fn has_dollar_quote(sql: &str) -> bool {
+    let bytes = sql.as_bytes();
+    bytes.iter().enumerate().any(|(i, &b)| {
+        if b != b'$' {
+            return false;
+        }
+        let tag = bytes[i + 1..]
+            .iter()
+            .take_while(|c| c.is_ascii_alphanumeric() || **c == b'_')
+            .count();
+        let starts_valid = tag == 0 || !bytes[i + 1].is_ascii_digit();
+        starts_valid && bytes.get(i + 1 + tag) == Some(&b'$')
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1644,6 +1708,22 @@ mod tests {
         // an unqualified DELETE.
         let sql = "DELETE FROM t -- note; still the same statement\n WHERE !!! garbage";
         assert_eq!(texts(sql), vec![sql]);
+    }
+
+    #[test]
+    fn a_non_ascii_character_in_unread_text_is_not_a_byte() {
+        // The scanner walks bytes and slices characters. A bare `\u{e9}` used to
+        // leave the cursor mid-character and panic the app rather than run
+        // anything -- quoted it was always safe, since the quote is jumped whole.
+        assert_eq!(texts("USE caf\u{e9}_db"), vec!["USE caf\u{e9}_db"]);
+        assert_eq!(
+            texts("CALL refresh_totals('caf\u{e9}')"),
+            vec!["CALL refresh_totals('caf\u{e9}')"]
+        );
+        assert_eq!(
+            texts("SELECT 1;\nUSE caf\u{e9}_db"),
+            vec!["SELECT 1", "USE caf\u{e9}_db"]
+        );
     }
 
     #[test]
@@ -2902,5 +2982,48 @@ mod tests {
             gate(&unreadable, Mode::Full, &[Destructive::Unreadable]),
             Some(Stop::RunOnce)
         );
+    }
+
+    #[test]
+    fn a_comment_the_user_wrote_survives_formatting() {
+        // The whole reason formatting is token-level: an AST round trip would
+        // drop this line, and the user would not get it back.
+        let formatted = format("select a -- the one we care about\nfrom t").unwrap();
+
+        assert!(
+            formatted.contains("-- the one we care about"),
+            "{formatted}"
+        );
+    }
+
+    // sqlformat reflows the inside of a `$$` body, which edits the literal
+    // rather than its layout. Refusing the buffer is the only answer that keeps
+    // hard rule 1; this is the test that catches the day that stops being true.
+    #[test]
+    fn a_buffer_holding_a_dollar_quoted_body_is_refused() {
+        assert_eq!(format("DO $$ BEGIN DELETE FROM t; END $$"), None);
+        assert_eq!(format("select $tag$ x; y $tag$"), None);
+    }
+
+    // A placeholder is not a quote, and reading it as one would refuse to format
+    // every parameterised statement anybody writes.
+    #[test]
+    fn a_numbered_placeholder_still_formats() {
+        assert!(format("select a from t where id = $1").is_some());
+    }
+
+    #[test]
+    fn formatting_an_already_formatted_statement_changes_nothing() {
+        let once = format("select a, b from t where x = 1").unwrap();
+
+        assert_eq!(format(&once).unwrap(), once);
+    }
+
+    #[test]
+    fn a_flat_statement_gains_line_breaks() {
+        let formatted = format("select a, b from t where x = 1").unwrap();
+
+        assert!(formatted.lines().count() > 1, "{formatted}");
+        assert!(formatted.contains("  "), "{formatted}");
     }
 }

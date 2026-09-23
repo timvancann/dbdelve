@@ -4,7 +4,6 @@ use std::io::{self, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
-use security_framework::passwords::{self, PasswordOptions};
 use serde::{Deserialize, Serialize};
 
 use crate::db::{Cell, RelationKind};
@@ -17,17 +16,17 @@ const NAME: &str = "dbdelve";
 /// only for tab 0 -- see [`read_scratch`].
 const LEGACY_SCRATCH_FILE: &str = ".scratch.sql";
 const HISTORY_FILE: &str = ".history.jsonl";
-/// How far back the history reads.
-///
-/// ponytail: the whole file is read and the newest entries kept. A line per
-/// statement run is small for a long time; read it backwards from the end if
-/// one ever gets big enough to feel.
+/// How far back the history reads, and what [`compact_history`] leaves on
+/// disk once the slack is used up.
 pub const HISTORY_DEPTH: usize = 200;
-/// `errSecItemNotFound`. Apple's `OSStatus` values are frozen ABI, and the
-/// named constant lives in `security-framework-sys`, which is not a dependency
-/// here -- adding it with the exact pin this project uses everywhere would
-/// fight `security-framework`'s own transitive bump of it.
-const ITEM_NOT_FOUND: i32 = -25300;
+/// How far past [`HISTORY_DEPTH`] the file may run before it is rewritten.
+///
+/// Rewriting on every run would cost a full write per statement to keep a
+/// handful of lines off the end. Letting it drift and compacting in one go
+/// amortises that to one rewrite per [`HISTORY_SLACK`] minus
+/// [`HISTORY_DEPTH`] runs, and bounds the file either way -- which is what
+/// makes reading the whole of it cheap.
+const HISTORY_SLACK: usize = HISTORY_DEPTH * 4;
 /// A grid past this many rows still runs and displays in full -- this is only
 /// how much of it a snapshot keeps on disk, so reopening a tab is instant
 /// without the cache growing as large as the result it is caching.
@@ -267,6 +266,8 @@ pub struct StoredSettings {
     pub editor_font_size: Option<f32>,
     #[serde(default)]
     pub preview_rows: Option<usize>,
+    #[serde(default)]
+    pub opacity: Option<f32>,
     /// Keybinding overrides, keyed by the action id in
     /// `keybindings::REGISTRY`. Only the ones a user actually changed --
     /// everything else stays on whatever the running build defaults to.
@@ -389,31 +390,36 @@ pub fn profile_id(name: &str, existing: &[String]) -> String {
 /// blank password is valid, so none of them can be inferred from the connect
 /// attempt that would follow.
 pub fn password(profile_id: &str) -> Result<Option<String>, String> {
-    let bytes = match passwords::generic_password(PasswordOptions::new_generic_password(
-        &variant_name()?,
-        profile_id,
-    )) {
-        Ok(bytes) => bytes,
-        Err(error) if error.code() == ITEM_NOT_FOUND => return Ok(None),
-        Err(error) => {
-            return Err(format!(
-                "Could not read the password from the keychain: {error}"
-            ));
+    match keychain_entry(profile_id)?.get_password() {
+        Ok(password) => Ok(Some(password)),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(keyring::Error::BadEncoding(_)) => {
+            Err("The keychain password is not valid text.".to_string())
         }
-    };
-    String::from_utf8(bytes)
-        .map(Some)
-        .map_err(|error| format!("The keychain password is not valid text: {error}"))
+        Err(error) => Err(format!(
+            "Could not read the password from the keychain: {error}"
+        )),
+    }
 }
 
 pub fn set_password(profile_id: &str, password: &str) -> Result<(), String> {
-    passwords::set_generic_password(&variant_name()?, profile_id, password.as_bytes())
+    keychain_entry(profile_id)?
+        .set_password(password)
         .map_err(|error| format!("Could not save the password to the keychain: {error}"))
 }
 
 pub fn delete_password(profile_id: &str) {
-    let Ok(service) = variant_name() else { return };
-    let _ = passwords::delete_generic_password(&service, profile_id);
+    if let Ok(entry) = keychain_entry(profile_id) {
+        let _ = entry.delete_credential();
+    }
+}
+
+/// Keychain Services on macOS, Secret Service on Linux. The service is the
+/// variant name and the account the profile id, which is what keeps a dev
+/// build's passwords apart from a release build's.
+fn keychain_entry(profile_id: &str) -> Result<keyring::Entry, String> {
+    keyring::Entry::new(&variant_name()?, profile_id)
+        .map_err(|error| format!("Could not reach the keychain: {error}"))
 }
 
 pub fn saved_queries(profile_id: &str) -> Vec<String> {
@@ -510,7 +516,7 @@ pub fn delete_scratch(profile_id: &str, tab: u64) -> Result<(), String> {
 /// newlines, semicolons and comments, so there is no separator to put between
 /// two of them that is not also SQL. Appended rather than rewritten, so a run
 /// costs one write and no history can be lost to a rewrite that failed
-/// halfway.
+/// halfway -- see [`compact_history`] for the one rewrite that does happen.
 pub fn append_history(profile_id: &str, sql: &str) -> Result<(), String> {
     let directory = query_directory(profile_id)?;
     fs::create_dir_all(&directory)
@@ -524,7 +530,40 @@ pub fn append_history(profile_id: &str, sql: &str) -> Result<(), String> {
         .open(&path)
         .map_err(|error| format!("Could not open {}: {error}", path.display()))?;
     secure(&path)?;
-    writeln!(file, "{line}").map_err(|error| format!("Could not write {}: {error}", path.display()))
+    writeln!(file, "{line}")
+        .map_err(|error| format!("Could not write {}: {error}", path.display()))?;
+    compact_history(&path);
+    Ok(())
+}
+
+/// Drops everything past [`HISTORY_DEPTH`] once the file has run
+/// [`HISTORY_SLACK`] lines long, so the append in `append_history` cannot grow
+/// it without bound.
+///
+/// Written through [`write_file`] rather than in place: the same
+/// temporary-then-rename that protects every other file here, so a compaction
+/// that fails halfway leaves the history it was trimming intact.
+///
+/// The rewrite is what [`decode_history`] would have returned anyway -- newest
+/// first, each statement once -- put back oldest first so a later read walks
+/// it the same way. Failures are dropped: the history is still correct to read,
+/// it just costs the disk it already had.
+fn compact_history(path: &Path) {
+    let Ok(text) = fs::read_to_string(path) else {
+        return;
+    };
+    if text.lines().count() <= HISTORY_SLACK {
+        return;
+    }
+    let mut kept = String::new();
+    for sql in decode_history(&text).iter().rev() {
+        let Ok(line) = serde_json::to_string(sql) else {
+            return;
+        };
+        kept.push_str(&line);
+        kept.push('\n');
+    }
+    let _ = write_file(path, &kept);
 }
 
 /// What this profile has run, newest first and each statement once. A missing
@@ -732,13 +771,25 @@ fn variant_name() -> Result<String, String> {
     Ok(format!("{NAME}-{variant}"))
 }
 
+/// macOS keeps Application Support, where every install before this already
+/// has its data. Everywhere else follows the XDG base directory spec.
 fn dbdelve_directory() -> Result<PathBuf, String> {
-    let home = std::env::var_os("HOME")
+    let variant = variant_name()?;
+    #[cfg(target_os = "macos")]
+    let root = home()?.join("Library/Application Support");
+    #[cfg(not(target_os = "macos"))]
+    let root = match std::env::var_os("XDG_DATA_HOME").filter(|value| !value.is_empty()) {
+        Some(data_home) => PathBuf::from(data_home),
+        None => home()?.join(".local/share"),
+    };
+    Ok(root.join(variant))
+}
+
+fn home() -> Result<PathBuf, String> {
+    std::env::var_os("HOME")
         .filter(|home| !home.is_empty())
-        .ok_or_else(|| "HOME is not set.".to_string())?;
-    Ok(PathBuf::from(home)
-        .join("Library/Application Support")
-        .join(variant_name()?))
+        .map(PathBuf::from)
+        .ok_or_else(|| "HOME is not set.".to_string())
 }
 
 fn query_directory(profile_id: &str) -> Result<PathBuf, String> {
@@ -832,18 +883,37 @@ mod tests {
         fs::create_dir_all(&home).expect("the test home must be creatable");
 
         let previous = std::env::var_os("HOME");
+        // `XDG_DATA_HOME` goes with it: left set, it would point the storage
+        // outside the test home on every platform that honours it.
+        let previous_data_home = std::env::var_os("XDG_DATA_HOME");
         // SAFETY: the lock above is what makes this the only thread reading or
         // writing the environment for as long as `body` runs.
-        unsafe { std::env::set_var("HOME", &home) };
+        unsafe {
+            std::env::set_var("HOME", &home);
+            std::env::remove_var("XDG_DATA_HOME");
+        }
         let outcome = body();
         unsafe {
             match previous {
                 Some(value) => std::env::set_var("HOME", value),
                 None => std::env::remove_var("HOME"),
             }
+            if let Some(value) = previous_data_home {
+                std::env::set_var("XDG_DATA_HOME", value);
+            }
         }
         let _ = fs::remove_dir_all(&home);
         outcome
+    }
+
+    /// What `dbdelve_directory` appends to the home the test set, which is
+    /// the platform's data directory and not one fixed path.
+    fn data_path(variant: &str) -> PathBuf {
+        if cfg!(target_os = "macos") {
+            PathBuf::from("Library/Application Support").join(variant)
+        } else {
+            PathBuf::from(".local/share").join(variant)
+        }
     }
 
     fn ids(names: &[&str]) -> Vec<String> {
@@ -1360,6 +1430,7 @@ open_objects = []
                 theme: Some("Dark".into()),
                 editor_font_size: Some(18.0),
                 preview_rows: Some(500),
+                opacity: Some(0.8),
                 custom_keybindings: Some(HashMap::from([(
                     "apply_edits".to_string(),
                     "cmd-shift-s".to_string(),
@@ -1485,13 +1556,13 @@ open_objects = []
                 variant(unset);
                 assert_eq!(variant_name().unwrap(), "dbdelve");
                 let directory = dbdelve_directory().unwrap();
-                assert!(directory.ends_with("Library/Application Support/dbdelve"));
+                assert!(directory.ends_with(data_path("dbdelve")));
             }
 
             variant(Some("dev"));
             assert_eq!(variant_name().unwrap(), "dbdelve-dev");
             let directory = dbdelve_directory().unwrap();
-            assert!(directory.ends_with("Library/Application Support/dbdelve-dev"));
+            assert!(directory.ends_with(data_path("dbdelve-dev")));
 
             // No NUL case: `set_var` panics on one before the code under test
             // ever sees it.
@@ -1527,6 +1598,37 @@ open_objects = []
         let text = format!("{}\n\"SELECT 2", serde_json::to_string("SELECT 1").unwrap());
 
         assert_eq!(decode_history(&text), ["SELECT 1"]);
+    }
+
+    #[test]
+    fn a_long_lived_history_stops_growing_at_the_slack() {
+        with_home(|| {
+            // One past the slack, so the last append is the one that has to
+            // trip the compaction.
+            let runs = HISTORY_SLACK + 1;
+            for n in 0..runs {
+                append_history("dev", &format!("SELECT {n}")).unwrap();
+            }
+
+            let path = query_directory("dev").unwrap().join(HISTORY_FILE);
+            let text = fs::read_to_string(&path).unwrap();
+            assert_eq!(text.lines().count(), HISTORY_DEPTH);
+
+            // Trimmed off the front, so what the user can still reach is the
+            // newest HISTORY_DEPTH runs and not some older window of them.
+            let read_back = history("dev");
+            assert_eq!(read_back.len(), HISTORY_DEPTH);
+            assert_eq!(read_back[0], format!("SELECT {}", runs - 1));
+            assert_eq!(
+                read_back[HISTORY_DEPTH - 1],
+                format!("SELECT {}", runs - HISTORY_DEPTH)
+            );
+
+            // The rewrite goes through `write_file`, so the mode the appends
+            // set has to survive it.
+            let mode = fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        });
     }
 
     #[test]

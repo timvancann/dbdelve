@@ -87,6 +87,7 @@ actions!(
     [
         RunQuery,
         CancelQuery,
+        FormatQuery,
         ShowEditor,
         CycleTheme,
         SaveQuery,
@@ -100,6 +101,7 @@ actions!(
         ZoomEditorOut,
         ResetEditorZoom,
         NextPage,
+        RefreshRelation,
         PreviousPage,
         ClearFilter,
         AddFilter,
@@ -121,6 +123,7 @@ actions!(
         PalettePrevious,
         CloseTab,
         ToggleSidebar,
+        ToggleRowPanel,
         AcceptCompletion,
         OpenSettings,
         ResetConfirmations,

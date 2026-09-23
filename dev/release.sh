@@ -27,7 +27,49 @@ cp -R target/DBDelve.app target/dmg/
 ln -s /Applications target/dmg/Applications
 hdiutil create -volname "DBDelve $VERSION" -srcfolder target/dmg -ov -format UDZO "$DMG"
 
-gh release create "v$VERSION" "$DMG" --title "DBDelve $VERSION" --generate-notes
+# The tag is pushed before the release exists because the push is what starts
+# the Linux build; the release is a draft until that build's tarballs are on it,
+# so the release page never goes public holding macOS alone.
+git tag -a "v$VERSION" -m "DBDelve $VERSION"
+git push origin "v$VERSION"
+
+gh release create "v$VERSION" "$DMG" --title "DBDelve $VERSION" --generate-notes --draft
+
+# Matched on the tag rather than taken as the newest run: a run for some other
+# tag or an earlier re-run would have this script watching the wrong build and
+# publishing on the strength of it. A tag push records the tag as the run's head
+# branch, which is what --branch filters on. The wait covers the few seconds
+# GitHub takes to register the run at all; no run after that means the push
+# never reached CI, and the draft is left for a hand-made upload.
+RUN=""
+for _ in $(seq 30); do
+  RUN="$(gh run list --workflow release-linux.yml --event push --branch "v$VERSION" \
+    --limit 1 --json databaseId --jq '.[0].databaseId // empty')"
+  [[ -n "$RUN" ]] && break
+  sleep 5
+done
+if [[ -z "$RUN" ]]; then
+  echo "no release-linux run for v$VERSION -- v$VERSION is still a draft" >&2
+  exit 1
+fi
+
+gh run watch "$RUN" --exit-status
+
+# A green run is not proof the assets landed: the upload step can be skipped by
+# a condition or clobber the wrong release. Every file both arches are supposed
+# to produce is named here, so a half-uploaded matrix -- or a matrix that built
+# the tarball and lost the AppImage -- fails while the release is still a draft.
+ASSETS="$(gh release view "v$VERSION" --json assets --jq '.assets[].name')"
+for ARCH in x86_64 aarch64; do
+  for ASSET in "dbdelve-$VERSION-linux-$ARCH.tar.gz" "dbdelve-$VERSION-$ARCH.AppImage"; do
+    if ! grep -qxF "$ASSET" <<<"$ASSETS"; then
+      echo "no $ASSET on v$VERSION -- v$VERSION is still a draft" >&2
+      exit 1
+    fi
+  done
+done
+
+gh release edit "v$VERSION" --draft=false
 
 if [[ -d "$TAP/.git" ]]; then
   SHA="$(shasum -a 256 "$DMG" | cut -d' ' -f1)"
@@ -41,7 +83,7 @@ cask "dbdelve" do
 
   url "https://github.com/ShayanAbbas1/dbdelve/releases/download/v#{version}/DBDelve-#{version}.dmg"
   name "DBDelve"
-  desc "Native macOS SQL client"
+  desc "Native SQL client"
   homepage "https://github.com/ShayanAbbas1/dbdelve"
 
   depends_on arch: :arm64

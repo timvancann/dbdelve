@@ -223,11 +223,11 @@ impl Workspace {
     /// by arrow is twenty clicks.
     ///
     /// Offsets stay multiples of the limit, the same invariant `turn_page`
-    /// keeps, so the label beside the field still reads the page back exactly.
+    /// keeps, so the field reads the page back exactly once it lands.
     /// Nothing here knows how long the relation is, so a page past its end is
     /// allowed to come back empty rather than be guessed at -- the previous
     /// arrow is the way back from one.
-    pub(crate) fn go_to_page(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn go_to_page(&mut self, cx: &mut Context<Self>) {
         self.clear_notice();
         let Some((id, input)) = self
             .profile()
@@ -246,7 +246,6 @@ impl Workspace {
             self.note(format!("{typed} is not a page number."), cx);
             return;
         };
-        input.update(cx, |state, cx| state.set_value("", window, cx));
         self.requery_relation(
             id,
             move |_, _, limit, offset| {
@@ -255,6 +254,42 @@ impl Workspace {
             },
             cx,
         );
+    }
+
+    /// Show the page in front in the field. Typing is left alone while the
+    /// page stays put; once it moves, the typed number was for a page that is
+    /// no longer the one in front, so it goes too.
+    ///
+    /// From render because the offset moves in more places than one -- the
+    /// arrows, the row-limit chips, a tab switch -- and the field is shared by
+    /// every tab, so reading it back once a frame is the one spot all of them
+    /// pass through.
+    pub(crate) fn sync_page_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(profile) = self.profile() else {
+            return;
+        };
+        let input = profile.session.page_input.clone();
+        let page = profile
+            .session
+            .active_object()
+            .and_then(|tab| match &tab.body {
+                ObjectBody::Relation { limit, offset, .. } => Some(offset / limit + 1),
+                _ => None,
+            });
+        let Some(page) = page else {
+            return;
+        };
+        let moved = profile.session.page_shown != page;
+        if !moved && input.focus_handle(cx).is_focused(window) {
+            return;
+        }
+        if let Some(profile) = self.profile_mut() {
+            profile.session.page_shown = page;
+        }
+        let page = page.to_string();
+        if input.read(cx).value() != page {
+            input.update(cx, |state, cx| state.set_value(page, window, cx));
+        }
     }
 
     /// A column header was clicked: put that column into the statement's
@@ -576,6 +611,45 @@ impl Workspace {
             return;
         };
         cx.write_to_clipboard(ClipboardItem::new_string(value));
+    }
+
+    /// One field of the row panel, taken from the fetched cell rather than the
+    /// re-indented, clipped text the panel paints. The field's button shows a
+    /// tick for a moment after, since a copy otherwise changes nothing on
+    /// screen.
+    pub(crate) fn copy_row_field(&mut self, row_ix: usize, col_ix: usize, cx: &mut Context<Self>) {
+        let Some(results) = self
+            .profile()
+            .and_then(|profile| profile.session.active_results())
+        else {
+            return;
+        };
+        let Some(value) = results
+            .read(cx)
+            .delegate()
+            .cell(row_ix, col_ix)
+            .map(str::to_string)
+        else {
+            return;
+        };
+        cx.write_to_clipboard(ClipboardItem::new_string(value));
+
+        let copied = Some((row_ix, col_ix));
+        self.row_panel.copied = copied;
+        cx.notify();
+        cx.spawn(async move |workspace, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(1500))
+                .await;
+            let _ = workspace.update(cx, |workspace, cx| {
+                // A later copy owns the tick now; this timer is not its to clear.
+                if workspace.row_panel.copied == copied {
+                    workspace.row_panel.copied = None;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
 
     /// Write the result set in front of the user to a file they pick.

@@ -14,6 +14,7 @@ use std::{collections::HashMap, sync::Arc};
 use gpui::{App, AppContext, Context, Entity, Window};
 use gpui_component::{
     input::{EditorState, InputEvent, InputState},
+    resizable::ResizableState,
     table::TableState,
     tree::TreeState,
 };
@@ -192,11 +193,13 @@ pub(crate) struct Session {
     /// list is wanted while a list is being built, which is a frame.
     pub(crate) history: Vec<String>,
     pub(crate) save_name: Entity<InputState>,
-    /// Where to jump to, never where we are: the label beside it is the only
-    /// claim about the current page, so this holds a typed page until Enter
-    /// spends it and empties it again. One field for the window, because only
-    /// the relation in front can be paged.
+    /// The page in front, and where to jump to once it is typed over: see
+    /// `sync_page_input`. One field for the window, because only the relation
+    /// in front can be paged.
     pub(crate) page_input: Entity<InputState>,
+    /// The page last written into `page_input`, to tell a page that moved
+    /// from one that is being typed over.
+    pub(crate) page_shown: usize,
     pub(crate) naming: bool,
     pub(crate) pending_delete: Option<String>,
     /// The saved query `cmd+w` is asking about.
@@ -222,6 +225,14 @@ pub(crate) struct Session {
     pub(crate) insert_form: Option<InsertForm>,
     /// The statement the mode check stopped, held until the user answers.
     pub(crate) pending_run: Option<PendingRun>,
+    /// The structure request each relation tab is waiting on, by tab id.
+    ///
+    /// A refresh asks for the definition again, and nothing stops a second
+    /// refresh starting while the first is in flight -- the engine reads the
+    /// catalog in several queries, so the older request can finish last and
+    /// put the older definition back. A completion that is not the newest
+    /// issued for its tab is dropped.
+    pub(crate) structure_requests: HashMap<u64, u64>,
 }
 
 /// A generated statement waiting to be read and run.
@@ -330,16 +341,14 @@ impl Session {
         )
         .detach();
 
-        let page_input = cx.new(|cx| InputState::new(window, cx).placeholder("Go to"));
-        // With the window, because arriving empties the field, and clearing an
-        // input is editing it.
-        cx.subscribe_in(
+        let page_input = cx.new(|cx| InputState::new(window, cx));
+        cx.subscribe(
             &page_input,
-            window,
-            |workspace, _, event: &InputEvent, window, cx| {
-                if matches!(event, InputEvent::PressEnter { .. }) {
-                    workspace.go_to_page(window, cx);
-                }
+            |workspace, _, event: &InputEvent, cx| match event {
+                InputEvent::PressEnter { .. } => workspace.go_to_page(cx),
+                // A page typed and abandoned goes back to the one in front.
+                InputEvent::Blur => cx.notify(),
+                _ => {}
             },
         )
         .detach();
@@ -396,6 +405,7 @@ impl Session {
             history: store::history(&id),
             save_name,
             page_input,
+            page_shown: 0,
             naming: false,
             pending_delete: None,
             pending_close: None,
@@ -404,6 +414,7 @@ impl Session {
             apply_review: None,
             insert_form: None,
             pending_run: None,
+            structure_requests: HashMap::new(),
         }
     }
 
@@ -575,7 +586,7 @@ pub(crate) enum Tab {
 }
 
 /// What `cmd+w` has to do with the surface in front of it.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CloseTarget {
     /// Close it. It is a view onto something the database still holds, and
     /// reopening it costs a click.
@@ -657,6 +668,13 @@ pub(crate) struct QueryTab {
     /// from `plan.is_some()`: a plan that has been read and flipped away from
     /// is still worth keeping to flip back to.
     pub(crate) showing_plan: bool,
+    /// Whether this tab's row-inspector panel is folded away. Per tab, like
+    /// the panel itself (see `RowPanel`), and not persisted.
+    pub(crate) row_panel_folded: bool,
+    /// The row-inspector split's state, per tab: a width dragged to in one
+    /// tab must not resize another's. Not persisted -- a fresh tab always
+    /// starts at the built-in default.
+    pub(crate) row_panel_split: Entity<ResizableState>,
 }
 
 /// A plan, and what it is a plan of.
@@ -709,6 +727,8 @@ impl QueryTab {
             hydrated: false,
             plan: None,
             showing_plan: false,
+            row_panel_folded: false,
+            row_panel_split: cx.new(|_| ResizableState::default()),
         };
         (tab, notice)
     }
@@ -950,6 +970,12 @@ pub(crate) enum ObjectBody {
         /// Whether this tab's snapshot has been looked for yet. See
         /// [`QueryTab::hydrated`].
         hydrated: bool,
+        /// Whether this tab's row-inspector panel is folded away. Per tab:
+        /// see `RowPanel`.
+        row_panel_folded: bool,
+        /// The row-inspector split's state, per tab. See
+        /// [`QueryTab::row_panel_split`].
+        row_panel_split: Entity<ResizableState>,
     },
     Routine(Routine),
 }

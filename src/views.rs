@@ -8,26 +8,27 @@
 //! surface it assembles, which is why the rest of the module is private.
 
 use gpui::{
-    AnyElement, ClickEvent, Context, Entity, FontWeight, InteractiveElement, IntoElement,
-    ParentElement, SharedString, StatefulInteractiveElement, Styled, Window, div,
-    prelude::FluentBuilder, px,
+    Animation, AnimationExt, AnyElement, ClickEvent, Context, Div, Entity, FontWeight,
+    InteractiveElement, IntoElement, ParentElement, SharedString, Stateful,
+    StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px,
 };
 use gpui_component::{
     Disableable, IconName, Sizable,
     button::Button,
-    input::{Editor, EditorState, Input},
+    input::{self, Editor, EditorState, Input},
     menu::DropdownMenu,
-    resizable::{resizable_panel, v_resizable},
+    resizable::{ResizableState, h_resizable, resizable_panel, v_resizable},
     spinner::Spinner,
     table::{DataTable, TableDelegate, TableState},
 };
 
 use crate::{
-    Settings, Workspace,
+    Workspace,
     actions::{
-        AddFilter, CancelQuery, ExplainQuery, NewQuery, NewRow, NextPage, PreviousPage,
-        RemoveFilter, ResetEditorZoom, RunQuery, SaveQuery, SetFilterColumn, SetFilterOperator,
-        SetFilterRaw, SetRowLimit, ToggleFilterJoin, ToggleNextJoin, ZoomEditorIn, ZoomEditorOut,
+        AddFilter, CancelQuery, ExplainQuery, FormatQuery, NewQuery, NewRow, NextPage,
+        PreviousPage, RemoveFilter, ResetEditorZoom, RunQuery, SaveQuery, SetFilterColumn,
+        SetFilterOperator, SetFilterRaw, SetRowLimit, ToggleFilterJoin, ToggleNextJoin,
+        ToggleRowPanel, ZoomEditorIn, ZoomEditorOut,
     },
     db,
     db::{Engine, ExplainMode, RoutineKind},
@@ -42,22 +43,41 @@ use crate::{
         CloseTarget, Explained, ObjectBody, ObjectTab, Profile, QueryState, StructureState, Tab,
         result_pane_is_expanded,
     },
-    theme::{FontSlot, Theme, fonts, layout, theme},
+    theme::{
+        FontSlot, OPACITY_DEFAULT, OPACITY_MAX, OPACITY_MIN, OPACITY_STEP, Theme, fonts, layout,
+        theme,
+    },
     ui::{
         Control, Tone, button, button_label, compact_count, dialog, group_thousands, icon_button,
-        key_hint, keycap_for, object_icon, row_icon, section_label,
+        key_hint, keycap_for, keycap_text, object_icon, row_icon, section_label,
     },
     workspace::{EDITOR_FONT_SIZE_MAX, EDITOR_FONT_SIZE_MIN, SettingsTab, editor_zoom_percent},
 };
 
+/// What the row panel needs that is not part of any one tab: whether it is
+/// on screen right now, and what was just copied. The fold and the split's
+/// width live on the tab instead (`QueryTab`/`ObjectBody::Relation`), in
+/// memory only, so a panel folded or resized away in one tab does not touch
+/// another -- and neither survives a restart.
+pub struct RowPanel {
+    /// Whether the last frame drew the panel, folded or not. Cleared at the
+    /// top of every frame and set only where the panel is built, so the toggle
+    /// can ignore a fold aimed at a panel that is not there to take it.
+    pub on_screen: std::cell::Cell<bool>,
+    /// The (row, column) whose value was just copied, so its button can show
+    /// a tick until the timer in `copy_row_field` clears it.
+    pub copied: Option<(usize, usize)>,
+}
+
 pub fn render_main_content(
     profile: &Profile,
     editor_font_size: f32,
+    row_panel: &RowPanel,
     cx: &mut Context<Workspace>,
 ) -> AnyElement {
     let body = match profile.session.active_object() {
-        Some(tab) => render_object(tab, profile.config.engine(), cx),
-        None => render_query_surface(profile, editor_font_size, cx),
+        Some(tab) => render_object(tab, profile.config.engine(), row_panel, cx),
+        None => render_query_surface(profile, editor_font_size, row_panel, cx),
     };
 
     div()
@@ -99,7 +119,25 @@ fn render_editor_surface(
                 .appearance(false)
                 .bordered(false)
                 .text_size(px(font_size))
-                .line_height(px(font_size * 1.55)),
+                .line_height(px(font_size * 1.55))
+                // The builder replaces the built-in menu rather than extending
+                // it, so the edit items are restated to keep them. Gone with the
+                // default are Go to Definition and Show Code Actions, which this
+                // editor drew permanently greyed -- dbdelve registers neither
+                // provider, and no language server is coming.
+                .context_menu(|menu, _, cx| {
+                    menu.menu("Cut", Box::new(input::Cut))
+                        .menu("Copy", Box::new(input::Copy))
+                        .menu_with_disabled(
+                            "Paste",
+                            cx.read_from_clipboard().is_none(),
+                            Box::new(input::Paste),
+                        )
+                        .separator()
+                        .menu("Select All", Box::new(input::SelectAll))
+                        .separator()
+                        .menu("Format Query", Box::new(FormatQuery))
+                }),
         );
 
     let expanded = result_pane_is_expanded(query);
@@ -131,6 +169,7 @@ fn render_editor_surface(
 fn render_query_surface(
     profile: &Profile,
     editor_font_size: f32,
+    row_panel: &RowPanel,
     cx: &mut Context<Workspace>,
 ) -> AnyElement {
     let Some(tab) = profile.session.active_query_tab() else {
@@ -141,7 +180,15 @@ fn render_query_surface(
     // that is already a split leaves neither enough room to read.
     let bottom = match tab.showing_plan.then_some(tab.plan.as_ref()).flatten() {
         Some(explained) => render_plan(explained, cx),
-        None => render_results(&tab.query, &tab.results, true, cx),
+        None => render_results(
+            &tab.query,
+            &tab.results,
+            true,
+            tab.row_panel_folded,
+            &tab.row_panel_split,
+            row_panel,
+            cx,
+        ),
     };
     render_editor_surface(
         // Keyed by the buffer rather than the profile: two query tabs are two
@@ -415,7 +462,12 @@ fn round_count(value: f64) -> String {
 /// An opened object. A relation's generated `SELECT` is an ordinary buffer
 /// the user can edit and run; only a routine, which has nothing to run, is
 /// read-only.
-fn render_object(tab: &ObjectTab, engine: Engine, cx: &mut Context<Workspace>) -> AnyElement {
+fn render_object(
+    tab: &ObjectTab,
+    engine: Engine,
+    row_panel: &RowPanel,
+    cx: &mut Context<Workspace>,
+) -> AnyElement {
     let t = *theme(cx);
     let ObjectBody::Relation {
         showing_structure,
@@ -424,6 +476,8 @@ fn render_object(tab: &ObjectTab, engine: Engine, cx: &mut Context<Workspace>) -
         query,
         filters,
         next_join,
+        row_panel_folded,
+        row_panel_split,
         ..
     } = &tab.body
     else {
@@ -450,12 +504,15 @@ fn render_object(tab: &ObjectTab, engine: Engine, cx: &mut Context<Workspace>) -
             *next_join,
             t,
         ))
-        .child(
-            div()
-                .flex_1()
-                .min_h_0()
-                .child(render_results(query, results, false, cx)),
-        )
+        .child(div().flex_1().min_h_0().child(render_results(
+            query,
+            results,
+            false,
+            *row_panel_folded,
+            row_panel_split,
+            row_panel,
+            cx,
+        )))
         .into_any_element()
 }
 
@@ -850,6 +907,9 @@ fn render_results(
     query: &QueryState,
     results: &Entity<TableState<ResultGrid>>,
     is_query: bool,
+    folded: bool,
+    split: &Entity<ResizableState>,
+    row_panel: &RowPanel,
     cx: &mut Context<Workspace>,
 ) -> AnyElement {
     let t = *theme(cx);
@@ -913,7 +973,7 @@ fn render_results(
         QueryState::Idle if is_query => Some(centered(
             key_hint(
                 t,
-                "cmd-enter",
+                "secondary-enter",
                 "runs the selection or statement under the cursor",
             )
             .into_any_element(),
@@ -986,32 +1046,46 @@ fn render_results(
                     .child(quiet_line("Refreshing…".into()))
                     .child(div().ml_auto().child(cancel(cx)))
             }))
-            .child(
-                div()
-                    .flex_1()
-                    .flex()
-                    .min_h_0()
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .h_full()
-                            .font_family(grid)
-                            // The grid's own delegate has no key hook and the
-                            // focused element is the table root, so `enter` is
-                            // caught here on its way out of the Table context.
-                            .on_action(cx.listener(Workspace::edit_cell))
-                            .on_action(cx.listener(Workspace::copy_cell))
-                            .on_action(cx.listener(Workspace::set_null))
-                            .on_action(cx.listener(Workspace::set_empty))
-                            .on_action(cx.listener(Workspace::set_default))
-                            .on_action(cx.listener(Workspace::request_write_mode))
-                            .on_action(cx.listener(Workspace::delete_row))
-                            .on_action(cx.listener(Workspace::follow_foreign_key))
-                            .child(DataTable::new(results).bordered(false).stripe(false)),
-                    )
-                    .children(render_row_inspector(results, cx)),
-            )
+            .child({
+                let data = div()
+                    .size_full()
+                    .min_w_0()
+                    .font_family(grid)
+                    // The grid's own delegate has no key hook and the
+                    // focused element is the table root, so `enter` is
+                    // caught here on its way out of the Table context.
+                    .on_action(cx.listener(Workspace::edit_cell))
+                    .on_action(cx.listener(Workspace::copy_cell))
+                    .on_action(cx.listener(Workspace::set_null))
+                    .on_action(cx.listener(Workspace::set_empty))
+                    .on_action(cx.listener(Workspace::set_default))
+                    .on_action(cx.listener(Workspace::request_write_mode))
+                    .on_action(cx.listener(Workspace::delete_row))
+                    .on_action(cx.listener(Workspace::follow_foreign_key))
+                    .child(DataTable::new(results).bordered(false).stripe(false));
+                let body = div().flex_1().flex().min_h_0();
+                match render_row_inspector(results, folded, row_panel, cx) {
+                    None => body.child(data),
+                    // Folded, the panel keeps a strip of the edge rather than
+                    // vanishing: a selected row with nowhere to bring its
+                    // values back from is a panel the user has lost.
+                    Some(strip) if folded => body.child(data).child(strip),
+                    Some(panel) => body.child(
+                        h_resizable("row-inspector-split")
+                            .with_state(split)
+                            .child(resizable_panel().child(data))
+                            .child(
+                                resizable_panel()
+                                    .size(px(layout::INSPECTOR_WIDTH))
+                                    .size_range(
+                                        px(layout::INSPECTOR_MIN_WIDTH)
+                                            ..px(layout::INSPECTOR_MAX_WIDTH),
+                                    )
+                                    .child(panel),
+                            ),
+                    ),
+                }
+            })
             .into_any_element()
     });
 
@@ -1035,6 +1109,8 @@ fn render_results(
 /// arrow keys move both.
 fn render_row_inspector(
     results: &Entity<TableState<ResultGrid>>,
+    folded: bool,
+    row_panel: &RowPanel,
     cx: &mut Context<Workspace>,
 ) -> Option<AnyElement> {
     let t = *theme(cx);
@@ -1053,20 +1129,43 @@ fn render_row_inspector(
     if fields.is_empty() {
         return None;
     }
+    row_panel.on_screen.set(true);
+
+    let fold = |id: &'static str, tooltip: &'static str, cx: &mut Context<Workspace>| {
+        icon_button(id, icon::ROW_PANEL, Tone::Quiet, Control::Compact, t)
+            .tooltip(tooltip)
+            .on_click(cx.listener(|workspace, _, window, cx| {
+                workspace.toggle_row_panel(&ToggleRowPanel, window, cx);
+            }))
+    };
+    if folded {
+        return Some(
+            div()
+                .h_full()
+                .flex_shrink_0()
+                .px(px(layout::SPACE_XS))
+                .border_l_1()
+                .border_color(t.border)
+                .child(
+                    div()
+                        .h(px(layout::TAB_HEIGHT))
+                        .flex()
+                        .items_center()
+                        .child(fold("show-row-inspector", "Show the row panel", cx)),
+                )
+                .into_any_element(),
+        );
+    }
 
     let table = results.clone();
     Some(
         div()
-            .w(px(layout::INSPECTOR_WIDTH))
-            .flex_shrink_0()
-            .h_full()
+            .size_full()
             .flex()
             .flex_col()
-            // The same plane as the results, separated by its edge rather
-            // than its tone: a second tint here reads as a slab pasted over
-            // the window instead of a panel inside it.
-            .border_l_1()
-            .border_color(t.border)
+            // The same plane as the results, separated by the split's seam
+            // rather than its tone: a second tint here reads as a slab pasted
+            // over the window instead of a panel inside it.
             .child(
                 div()
                     .h(px(layout::TAB_HEIGHT))
@@ -1085,19 +1184,24 @@ fn render_row_inspector(
                             )),
                     )
                     .child(
-                        div().ml_auto().child(
-                            icon_button(
-                                "close-row-inspector",
-                                icon::CLOSE,
-                                Tone::Quiet,
-                                Control::Compact,
-                                t,
-                            )
-                            .tooltip("Close the row panel")
-                            .on_click(move |_, _, cx| {
-                                table.update(cx, |table, cx| table.clear_selection(cx));
-                            }),
-                        ),
+                        div()
+                            .ml_auto()
+                            .flex()
+                            .items_center()
+                            .child(fold("hide-row-inspector", "Hide the row panel", cx))
+                            .child(
+                                icon_button(
+                                    "close-row-inspector",
+                                    icon::CLOSE,
+                                    Tone::Quiet,
+                                    Control::Compact,
+                                    t,
+                                )
+                                .tooltip("Close the row panel")
+                                .on_click(move |_, _, cx| {
+                                    table.update(cx, |table, cx| table.clear_selection(cx));
+                                }),
+                            ),
                     ),
             )
             .child(
@@ -1111,8 +1215,49 @@ fn render_row_inspector(
                     .flex()
                     .flex_col()
                     .gap(px(layout::SPACE_MD))
-                    .children(fields.into_iter().map(|field| {
+                    .children(fields.into_iter().enumerate().map(|(col_ix, field)| {
+                        let group = format!("row-field-{col_ix}");
+                        let copy = field.value.is_some().then(|| {
+                            if row_panel.copied == Some((row_ix, col_ix)) {
+                                return div()
+                                    .size(px(Control::Compact.height()))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .child(
+                                        icon(icon::CHECK)
+                                            .size(px(layout::ICON_SIZE))
+                                            .text_color(t.success),
+                                    )
+                                    .with_animation(
+                                        ("copied-row-field", col_ix),
+                                        Animation::new(std::time::Duration::from_millis(150)),
+                                        |tick, delta| tick.opacity(delta),
+                                    )
+                                    .into_any_element();
+                            }
+                            div()
+                                .opacity(0.)
+                                .group_hover(group.clone(), |style| style.opacity(1.))
+                                .child(
+                                    icon_button(
+                                        ("copy-row-field", col_ix),
+                                        icon::COPY,
+                                        Tone::Quiet,
+                                        Control::Compact,
+                                        t,
+                                    )
+                                    .tooltip("Copy value")
+                                    .on_click(cx.listener(
+                                        move |workspace, _, _, cx| {
+                                            workspace.copy_row_field(row_ix, col_ix, cx);
+                                        },
+                                    )),
+                                )
+                                .into_any_element()
+                        });
                         div()
+                            .group(group)
                             .flex()
                             .flex_col()
                             .gap(px(layout::SPACE_XS))
@@ -1130,14 +1275,21 @@ fn render_row_inspector(
                                     // Absent rather than guessed: a type
                                     // dbdelve could not learn is not shown as
                                     // one it inferred from the text.
-                                    .children(field.data_type.map(|data_type| {
+                                    .child(
                                         div()
                                             .ml_auto()
                                             .flex_shrink_0()
-                                            .text_size(px(layout::TEXT_XS))
-                                            .text_color(t.text_faint)
-                                            .child(data_type)
-                                    })),
+                                            .flex()
+                                            .items_center()
+                                            .gap(px(layout::SPACE_XS))
+                                            .children(field.data_type.map(|data_type| {
+                                                div()
+                                                    .text_size(px(layout::TEXT_XS))
+                                                    .text_color(t.text_faint)
+                                                    .child(data_type)
+                                            }))
+                                            .children(copy),
+                                    ),
                             )
                             .child(
                                 div()
@@ -1374,6 +1526,22 @@ fn render_tab_strip(
             .child(name)
     };
 
+    // Middle-click closes the tab, as it does in every browser and editor. It
+    // goes through `ask_before_close` rather than the chip's own button so the
+    // gesture means what `cmd+w` means -- a saved query is still asked about
+    // rather than deleted by a stray wheel press.
+    let close_on_middle_click = |chip: Stateful<Div>, target: CloseTarget| {
+        let workspace = workspace.clone();
+        chip.on_aux_click(move |event, _, cx| {
+            if !event.is_middle_click() {
+                return;
+            }
+            _ = workspace.update(cx, |workspace, cx| {
+                workspace.ask_before_close(target.clone(), cx);
+            });
+        })
+    };
+
     // One chip per unsaved buffer, numbered in strip order. There used to be
     // exactly one, because there used to be exactly one editor.
     let unsaved_count = session
@@ -1440,6 +1608,9 @@ fn render_tab_strip(
                         workspace.activate_tab(Tab::Query(id), cx);
                     });
                 })
+                .when(unsaved_count > 1, |chip| {
+                    close_on_middle_click(chip, CloseTarget::Buffer(id))
+                })
                 .into_any_element()
         })
         .collect::<Vec<_>>();
@@ -1452,6 +1623,7 @@ fn render_tab_strip(
             .map(|(index, name)| {
                 let open_name = name.clone();
                 let delete_name = name.clone();
+                let middle_name = name.clone();
                 let open_workspace = workspace.clone();
                 let delete_workspace = workspace.clone();
                 let pending = session.pending_delete.as_deref() == Some(name);
@@ -1510,6 +1682,9 @@ fn render_tab_strip(
                         _ = open_workspace.update(cx, |workspace, cx| {
                             workspace.open_saved_query(open_name.clone(), window, cx);
                         });
+                    })
+                    .map(|chip| {
+                        close_on_middle_click(chip, CloseTarget::SavedQuery(middle_name.clone()))
                     })
                     .into_any_element()
             }),
@@ -1574,6 +1749,7 @@ fn render_tab_strip(
                     workspace.activate_tab(Tab::Object(id), cx);
                 });
             })
+            .map(|chip| close_on_middle_click(chip, CloseTarget::Object(id)))
             .into_any_element()
     }));
 
@@ -1710,7 +1886,7 @@ fn render_tab_strip(
     // The pager appears only once there is somewhere to go: a first page
     // shorter than its limit is the whole relation, and arrows over it are
     // controls that can do nothing.
-    let pager = preview.and_then(|(limit, offset, full_page)| {
+    let pager = preview.and_then(|(_, offset, full_page)| {
         (offset > 0 || full_page).then(|| {
             div()
                 .flex_shrink_0()
@@ -1731,18 +1907,32 @@ fn render_tab_strip(
                     })
                 }))
                 .child(
+                    // Dressed as the row-limit chips beside it rather than as
+                    // the library's field: its own fill is the frost again,
+                    // which stacks to a black slab on this strip. A wash lets
+                    // the glass through and is a faint step on opaque themes.
                     div()
+                        .h(px(layout::CONTROL_HEIGHT_COMPACT))
+                        .w(px(44.))
+                        .px(px(layout::SPACE_SM))
+                        .flex()
+                        .items_center()
+                        .rounded(px(layout::RADIUS_CONTROL))
+                        .bg(t.element_active)
+                        // The strong edge is what says "type here": on glass
+                        // the wash alone is close to the strip behind it.
+                        .border_1()
+                        .border_color(t.border_strong)
                         .text_size(px(layout::TEXT_SM))
-                        .text_color(t.text_faint)
-                        // Offsets are multiples of the limit by construction --
-                        // paging moves a page at a time and every other change
-                        // resets to the first -- so the page number is exact.
-                        .child(format!("Page {}", offset / limit + 1)),
+                        .text_color(t.text)
+                        .child(
+                            Input::new(&session.page_input)
+                                .appearance(false)
+                                .px_0()
+                                .h_full()
+                                .text_size(px(layout::TEXT_SM)),
+                        ),
                 )
-                // Beside the label rather than replacing it: the label is
-                // state, this is a destination, and a field that were both
-                // would have to be kept in step with every arrow and chip.
-                .child(Input::new(&session.page_input).small().w(px(64.)))
                 .children(full_page.then(|| {
                     icon_button(
                         "next-page",
@@ -1828,7 +2018,7 @@ fn render_tab_strip(
             div()
                 .flex_shrink_0()
                 .text_color(t.text_faint)
-                .child(format!("{zoom}% · ⌘0 resets"))
+                .child(format!("{zoom}% · {} resets", keycap_text("secondary-0")))
         }))
         .children(naming)
         // A named query is already written to disk on every swap, so there
@@ -1934,7 +2124,7 @@ pub fn render_settings(workspace: &Workspace, cx: &mut Context<Workspace>) -> An
         ));
 
     let body = match tab {
-        SettingsTab::General => render_general_settings(&workspace.settings, cx),
+        SettingsTab::General => render_general_settings(workspace, cx),
         SettingsTab::Keybindings => render_keybindings_settings(workspace, cx),
     };
 
@@ -1955,8 +2145,8 @@ pub fn render_settings(workspace: &Workspace, cx: &mut Context<Workspace>) -> An
                 .child(body)
                 .child(div().flex().justify_end().child(
                     button("settings-done", "Done", Tone::Primary, Control::Standard, t).on_click(
-                        cx.listener(|workspace, _: &ClickEvent, _, cx| {
-                            workspace.close_settings(cx);
+                        cx.listener(|workspace, _: &ClickEvent, window, cx| {
+                            workspace.close_settings(window, cx);
                         }),
                     ),
                 )),
@@ -1966,11 +2156,11 @@ pub fn render_settings(workspace: &Workspace, cx: &mut Context<Workspace>) -> An
 
 /// The Theme / Editor zoom / Fonts / Default limit sections -- unchanged from
 /// before the Keybindings tab existed, just no longer the whole modal.
-fn render_general_settings(settings: &Settings, cx: &mut Context<Workspace>) -> AnyElement {
+fn render_general_settings(workspace: &Workspace, cx: &mut Context<Workspace>) -> AnyElement {
     let t = *theme(cx);
     let families = fonts(cx).clone();
-    let font_size = settings.editor_font_size;
-    let preview_rows = settings.preview_rows;
+    let font_size = workspace.settings.editor_font_size;
+    let preview_rows = workspace.settings.preview_rows;
 
     let themes: Vec<AnyElement> = Theme::all()
         .into_iter()
@@ -2019,6 +2209,55 @@ fn render_general_settings(settings: &Settings, cx: &mut Context<Workspace>) -> 
                     workspace.reset_editor_zoom(&ResetEditorZoom, window, cx);
                 },
             )),
+        );
+
+    // Disabled wholesale on an opaque theme rather than hidden: the setting is
+    // still remembered, it is just that a theme which paints its own chrome
+    // has no desktop behind it for this to let through.
+    let opacity = workspace.settings.opacity;
+    let transparency = div()
+        .flex()
+        .items_center()
+        .gap(px(layout::SPACE_SM))
+        .child(
+            button("opacity-down", "−", Tone::Quiet, Control::Compact, t)
+                .disabled(!t.is_glass || opacity <= OPACITY_MIN)
+                .on_click(cx.listener(|workspace, _: &ClickEvent, window, cx| {
+                    workspace.step_opacity(-OPACITY_STEP, window, cx);
+                })),
+        )
+        .child(
+            // The sign sits beside the field rather than in it. `suffix` lays
+            // out inside the width declared here and pads again on its own, so
+            // a small input carrying one leaves under twenty points for the
+            // text: at 56 the committed 95 rendered as a clipped 9 and a 5.
+            // This is the readout's own width instead -- three typed digits
+            // and the caret, since 100 is reachable on the way to a value that
+            // clamps, inside the small size's 8-point padding.
+            Input::new(&workspace.opacity_input)
+                .small()
+                .w(px(52.))
+                .disabled(!t.is_glass),
+        )
+        .child(
+            div()
+                .text_size(px(layout::TEXT_SM))
+                .text_color(t.text_faint)
+                .child("%"),
+        )
+        .child(
+            button("opacity-up", "+", Tone::Quiet, Control::Compact, t)
+                .disabled(!t.is_glass || opacity >= OPACITY_MAX)
+                .on_click(cx.listener(|workspace, _: &ClickEvent, window, cx| {
+                    workspace.step_opacity(OPACITY_STEP, window, cx);
+                })),
+        )
+        .child(
+            button("opacity-reset", "Reset", Tone::Quiet, Control::Compact, t)
+                .disabled(!t.is_glass)
+                .on_click(cx.listener(|workspace, _: &ClickEvent, window, cx| {
+                    workspace.set_opacity(OPACITY_DEFAULT, window, cx);
+                })),
         );
 
     // The palette rather than a dropdown of our own: it already lists every
@@ -2078,6 +2317,26 @@ fn render_general_settings(settings: &Settings, cx: &mut Context<Workspace>) -> 
             t,
             "Theme",
             div().flex().gap(px(layout::SPACE_XS)).children(themes),
+        ))
+        .child(settings_section(
+            t,
+            "Opacity",
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(layout::SPACE_XS))
+                .child(transparency)
+                .child(
+                    div()
+                        .text_size(px(layout::TEXT_XS))
+                        .text_color(t.text_faint)
+                        .child(
+                            "Everything else is relative to this. The chrome, \
+                             the editor and the results grid are tints over \
+                             the frost set here, so they move with it rather \
+                             than being set apiece.",
+                        ),
+                ),
         ))
         .child(settings_section(t, "Editor zoom", zoom))
         .child(settings_section(

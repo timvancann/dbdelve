@@ -16,10 +16,13 @@ use gpui_component::{
     kbd::Kbd,
 };
 
+use std::collections::HashMap;
+
 use crate::{
     db::{RelationKind, RoutineKind},
     explorer::ObjectKind,
     icons::icon,
+    keybindings,
     sql::Mode,
     theme::{self, ConnectionColor, Theme, layout},
 };
@@ -62,25 +65,37 @@ pub(crate) fn row_icon_tinted(
 /// database am I on" and "what can I do to it" are read in one glance or not at
 /// all.
 ///
-/// Deliberately not tinted with the connection's `ConnectionColor`: that colour
-/// answers the first question, and two things wearing one hue answer neither.
+/// Drawn as the same tinted pill as the connection switcher beside it, in a
+/// hue that climbs with what the mode lets through: green reads, yellow
+/// writes, red can do anything.
 ///
 /// A `Button` rather than the plain `Div` this drew as before Task 7: the
 /// titlebar hangs a `dropdown_menu` off it, and that trait is bounded on
 /// `Selectable`, which `Div` does not implement.
 pub(crate) fn mode_pill(t: Theme, mode: Mode) -> Button {
-    button(
-        "connection-mode",
-        mode.label(),
-        Tone::Quiet,
-        Control::Compact,
-        t,
-    )
-    .border_1()
-    .border_color(match mode {
-        Mode::Full => t.border_strong,
-        _ => t.border,
-    })
+    let (color, path) = match mode {
+        Mode::ReadOnly => (ConnectionColor::Green, icon::READ_ONLY),
+        Mode::ReadWrite => (ConnectionColor::Yellow, icon::READ_WRITE),
+        Mode::Full => (ConnectionColor::Red, icon::FULL_ACCESS),
+    };
+    // The look is set on a plain `Div` inside rather than on the `Button`, so
+    // the button's own label sizing cannot drift it from the switcher's.
+    control("connection-mode", Tone::Quiet, Control::Compact)
+        .px(px(layout::SPACE_SM))
+        .rounded(px(layout::RADIUS_CONTROL))
+        .bg(color.fill())
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(layout::SPACE_XS))
+                .text_size(px(layout::TEXT_SM))
+                .text_color(t.text)
+                .font_weight(FontWeight::MEDIUM)
+                .child(row_icon_tinted(t, path, Some(color)))
+                .child(mode.label())
+                .child(row_icon(t, icon::CHEVRON_DOWN)),
+        )
 }
 
 /// dbdelve's own titlebar, drawn where the platform's would be.
@@ -91,12 +106,15 @@ pub(crate) fn mode_pill(t: Theme, mode: Mode) -> Button {
 /// is why the drag region is a child covering what is left of the row rather
 /// than the row itself: a drag region swallows the clicks a button needs, so
 /// anything interactive goes in `leading`, outside it.
+///
+/// On Linux the window wears a real system titlebar instead, so this row keeps
+/// only the job the system one cannot do — saying, through the connection
+/// switcher in `leading`, which database is in front of you. Nothing is inset
+/// for buttons that are drawn above rather than over it, and moving the window
+/// belongs to the bar the compositor drew.
 pub(crate) fn titlebar(
-    t: Theme,
-    subtitle: Option<String>,
-    color: Option<ConnectionColor>,
     mode: Option<AnyElement>,
-    leading: Option<AnyElement>,
+    leading: Vec<AnyElement>,
 ) -> impl IntoElement {
     div()
         .h(px(layout::TITLEBAR_HEIGHT))
@@ -105,43 +123,25 @@ pub(crate) fn titlebar(
         .flex_shrink_0()
         .items_center()
         .gap(px(layout::SPACE_MD))
-        .pl(px(layout::TITLEBAR_LEADING_INSET))
+        .pl(px(match cfg!(target_os = "linux") {
+            true => layout::SPACE_MD,
+            false => layout::TITLEBAR_LEADING_INSET,
+        }))
         .pr(px(layout::SPACE_MD))
         .children(leading)
         .child(
             div()
                 .id("titlebar")
-                .window_control_area(gpui::WindowControlArea::Drag)
-                .on_double_click(|_, window, _| window.titlebar_double_click())
+                .when(!cfg!(target_os = "linux"), |strip| {
+                    strip
+                        .window_control_area(gpui::WindowControlArea::Drag)
+                        .on_double_click(|_, window, _| window.titlebar_double_click())
+                })
                 .flex_1()
                 .h_full()
                 .flex()
                 .items_center()
                 .gap(px(layout::SPACE_SM))
-                .children(subtitle.map(|subtitle| {
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(px(layout::SPACE_XS))
-                        .text_size(px(layout::TEXT_SM))
-                        .text_color(t.text_faint)
-                        .child(row_icon_tinted(t, icon::DATABASE, color))
-                        .child(subtitle)
-                        // With a colour the name is the one thing in the
-                        // titlebar wearing it, so it stops being a subtitle and
-                        // becomes the label of a pill filled with its own hue.
-                        // The fill and the icon carry the colour; the text does
-                        // not, because the same hue at text size on a tint of
-                        // itself is the one arrangement nobody can read.
-                        .when_some(color, |pill, color| {
-                            pill.px(px(layout::SPACE_SM))
-                                .py(px(layout::SPACE_XS))
-                                .rounded(px(layout::RADIUS_CONTROL))
-                                .bg(color.fill())
-                                .text_color(t.text)
-                                .font_weight(FontWeight::MEDIUM)
-                        })
-                }))
                 .children(mode),
         )
 }
@@ -309,6 +309,34 @@ pub(crate) fn keycap_for(stroke: &str) -> Option<Kbd> {
     Keystroke::parse(stroke).ok().map(Kbd::new)
 }
 
+/// The same cap as plain text, for the readouts that run as a sentence rather
+/// than carrying a chip of their own. `Kbd`'s own formatter, so a cap written
+/// into a string reads the way the drawn ones do -- `⌘0` on macOS, `Ctrl+0`
+/// where there is no Command key.
+///
+/// Space-separated strokes are a two-stroke chord, which `Kbd` has no notion
+/// of: each stroke is formatted on its own and they are joined the way the
+/// binding is written.
+pub(crate) fn keycap_text(chord: &str) -> String {
+    chord
+        .split_whitespace()
+        .filter_map(|stroke| Keystroke::parse(stroke).ok().map(|key| Kbd::format(&key)))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The cap to draw beside an action, read from the keymap rather than written
+/// beside the label: a hint spelled out at the call site goes on claiming the
+/// shipped chord after the action has been rebound to another one.
+pub(crate) fn chord_hint(id: &str, overrides: &HashMap<String, String>) -> String {
+    keybindings::REGISTRY
+        .iter()
+        .find(|spec| spec.id == id)
+        .and_then(|spec| keybindings::chords_for(spec, overrides).first().copied())
+        .map(keycap_text)
+        .unwrap_or_default()
+}
+
 /// A shortcut hint and what it does, in the app face rather than the editor's
 /// monospace -- these are sentences about the UI, not query output.
 pub(crate) fn key_hint(
@@ -399,6 +427,21 @@ pub(crate) fn human_bytes(bytes: u64) -> String {
 mod tests {
     use super::*;
     use crate::explorer;
+
+    #[test]
+    fn a_hint_follows_a_rebound_action_rather_than_its_shipped_chord() {
+        let mut overrides = HashMap::new();
+        let shipped = chord_hint("refresh_relation", &overrides);
+        overrides.insert(
+            "refresh_relation".to_string(),
+            "secondary-shift-r".to_string(),
+        );
+        let rebound = chord_hint("refresh_relation", &overrides);
+        assert!(!shipped.is_empty());
+        assert_ne!(shipped, rebound);
+        // An action nothing has bound draws no cap at all.
+        assert_eq!(chord_hint("cancel_query", &overrides), "");
+    }
 
     #[test]
     fn a_row_limit_reads_as_a_chip_not_as_a_number() {

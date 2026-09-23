@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=DBDelve
+Comment=A modern and performant database client for Postgres, MySQL and SQLite
+Exec=dbdelve %f
+Icon=dbdelve
+Terminal=false
+Categories=Development;Database;
+MimeType=application/vnd.sqlite3;application/x-sqlite3;
+# Equal to the app id the window sets for itself, which is what keeps the
+# running window under this icon in the dock rather than beside it. The two
+# have to move together.
+StartupWMClass=dbdelve

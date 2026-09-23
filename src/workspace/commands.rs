@@ -99,17 +99,31 @@ impl Workspace {
     pub(crate) fn open_settings(
         &mut self,
         _: &OpenSettings,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Seeded on the way in rather than at startup: the opacity is restored
+        // from disk well after the workspace is built, and this is the only
+        // moment the field is about to be looked at.
+        let percent = opacity_percent(self.settings.opacity).to_string();
+        self.opacity_input
+            .update(cx, |input, cx| input.set_value(percent, window, cx));
         self.settings_open = true;
         cx.notify();
     }
 
-    pub(crate) fn close_settings(&mut self, cx: &mut Context<Self>) -> bool {
+    pub(crate) fn close_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         if !self.settings_open {
             return false;
         }
+        // Backing out of the modal is not a way to set the opacity: the field
+        // leaves the tree on the next frame, which blurs it, and a blur
+        // commits. Put the live value back first so that commit is a no-op --
+        // otherwise escaping out of a half-typed `5` on the way to `50` leaves
+        // the window at the floor.
+        let percent = opacity_percent(self.settings.opacity).to_string();
+        self.opacity_input
+            .update(cx, |input, cx| input.set_value(percent, window, cx));
         self.settings_open = false;
         self.rebinding = None;
         cx.notify();
@@ -192,6 +206,7 @@ impl Workspace {
             Command::NewQuery => self.new_query(&NewQuery, window, cx),
             Command::RunQuery => self.run_query(&RunQuery, window, cx),
             Command::ExplainQuery(mode) => self.explain_query(&ExplainQuery { mode }, window, cx),
+            Command::FormatQuery => self.format_query(&FormatQuery, window, cx),
             Command::ShowPlan(showing) => self.show_plan(showing, cx),
             Command::SaveQuery => self.save_query(&SaveQuery, window, cx),
             Command::RenameQuery => self.rename_query(window, cx),
@@ -220,6 +235,7 @@ impl Workspace {
             Command::PickFont(slot) => self.open_palette(PaletteMode::Font(slot), window, cx),
             Command::SetFont(slot, family) => self.set_font(slot, family, cx),
             Command::ToggleSidebar => self.toggle_sidebar(&ToggleSidebar, window, cx),
+            Command::ToggleRowPanel => self.toggle_row_panel(&ToggleRowPanel, window, cx),
             Command::ResetEditorZoom => self.reset_editor_zoom(&ResetEditorZoom, window, cx),
             Command::OpenSettings => self.open_settings(&OpenSettings, window, cx),
         }

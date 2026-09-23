@@ -30,6 +30,10 @@ use crate::*;
 pub(crate) struct Settings {
     pub(crate) editor_font_size: f32,
     pub(crate) preview_rows: usize,
+    /// How much of the window the desktop shows through. Lives here rather
+    /// than on the theme the user picked, so it survives switching themes --
+    /// it is reapplied to whichever theme gets installed.
+    pub(crate) opacity: f32,
     /// Keybinding overrides, keyed by action id. Applied to the keymap on
     /// the next launch -- see `src/keybindings.rs`.
     pub(crate) custom_keybindings: HashMap<String, String>,
@@ -40,6 +44,7 @@ impl Default for Settings {
         Self {
             editor_font_size: EDITOR_FONT_SIZE_DEFAULT,
             preview_rows: PREVIEW_ROW_LIMIT,
+            opacity: theme::OPACITY_DEFAULT,
             custom_keybindings: HashMap::new(),
         }
     }
@@ -74,6 +79,7 @@ pub(crate) struct Workspace {
     /// Whether the explorer column is folded away. Not persisted: a hidden
     /// sidebar is a thing done for the next minute, not a preference.
     pub(crate) sidebar_hidden: bool,
+    pub(crate) row_panel: views::RowPanel,
     pub(crate) pending_removal: Option<String>,
     /// Whether `store::load_profiles` failed outright rather than finding no
     /// file. Set once at startup and never cleared, because the file it could
@@ -86,6 +92,10 @@ pub(crate) struct Workspace {
     /// can move underneath it — so it is thrown away on the way out rather
     /// than kept and refreshed.
     pub(crate) palette: Option<Entity<ListState<Palette>>>,
+    /// The opacity field in the settings modal. Kept here rather than built
+    /// with the card, because an input is state the user is part-way through
+    /// typing into and a fresh one every frame would swallow the keystroke.
+    pub(crate) opacity_input: Entity<InputState>,
     /// The window's own focus, for the moments when nothing inside it can hold
     /// any. See [`Focus::Window`].
     pub(crate) focus: FocusHandle,
@@ -93,6 +103,21 @@ pub(crate) struct Workspace {
 
 impl Workspace {
     pub(crate) fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let opacity_input = cx.new(|cx| InputState::new(window, cx));
+        // With the window, because committing reinstalls the theme. Enter and
+        // blur both count as done: a percentage is short enough that clicking
+        // away from it is as much an answer as pressing return.
+        cx.subscribe_in(
+            &opacity_input,
+            window,
+            |workspace, _, event: &InputEvent, window, cx| {
+                if matches!(event, InputEvent::PressEnter { .. } | InputEvent::Blur) {
+                    workspace.commit_opacity_input(window, cx);
+                }
+            },
+        )
+        .detach();
+
         let mut workspace = Self {
             profiles: Vec::new(),
             settings: Settings::default(),
@@ -103,10 +128,15 @@ impl Workspace {
             settings_tab: SettingsTab::default(),
             rebinding: None,
             sidebar_hidden: false,
+            row_panel: views::RowPanel {
+                on_screen: Default::default(),
+                copied: None,
+            },
             pending_removal: None,
             store_unreadable: false,
             next_generation: 0,
             palette: None,
+            opacity_input,
             focus: cx.focus_handle(),
         };
 
@@ -118,7 +148,13 @@ impl Workspace {
                 let available = cx.text_system().all_font_names();
                 install_fonts(restored_fonts(stored_fonts, &available), cx);
                 let stored_settings = stored_settings.unwrap_or_default();
-                install_theme(restored_theme(stored_settings.theme.as_deref()), window, cx);
+                workspace.settings.opacity = restored_opacity(stored_settings.opacity);
+                install_theme(
+                    restored_theme(stored_settings.theme.as_deref())
+                        .with_opacity(workspace.settings.opacity),
+                    window,
+                    cx,
+                );
                 // The zoom was per-profile until settings existed, so a file
                 // with no app-wide value has one under whichever profile was in
                 // front -- and reading it there is what keeps a person's zoom
@@ -217,20 +253,41 @@ impl Workspace {
         // also the only place early enough to read back a chord the app already
         // has bound, which is most of what a rebind is for.
         let this = cx.weak_entity();
-        cx.intercept_keystrokes(move |event, _, cx| {
+        cx.intercept_keystrokes(move |event, window, cx| {
             let keystroke = event.keystroke.clone();
             this.update(cx, |workspace, cx| {
                 if !workspace.settings_open || keybindings::is_modifier(&keystroke.key) {
                     return;
                 }
                 match (workspace.rebinding, keystroke.key.as_str()) {
-                    // The one stroke the modal passes on: with nothing
-                    // mid-capture, escape is what closes it.
+                    // Passed on: with nothing mid-capture, escape is what
+                    // closes the modal.
                     (None, "escape") => return,
                     (Some(_), "escape") => workspace.cancel_rebind(cx),
                     // `unparse`, not `to_string` -- the latter is the glyphs a
                     // menu draws, and nothing reads those back.
                     (Some(id), _) => workspace.apply_rebind(id, keystroke.unparse(), cx),
+                    // Owning the keyboard was written when nothing in the
+                    // modal could be typed into, and a field that cannot see
+                    // a keystroke is a field nobody can fill. A capture in
+                    // progress still outranks it -- that is the arm above.
+                    //
+                    // Only what the field can actually consume, though: every
+                    // chord the app binds is `secondary-`, so passing those on
+                    // too would close the tab behind the modal on `cmd-w`. The
+                    // clipboard keys are the exception -- the input binds them
+                    // in its own context, which dispatch reaches before
+                    // anything global.
+                    (None, _)
+                        if workspace.opacity_input.focus_handle(cx).is_focused(window)
+                            && (!keystroke.modifiers.secondary()
+                                || matches!(
+                                    keystroke.key.as_str(),
+                                    "a" | "c" | "v" | "x" | "z"
+                                )) =>
+                    {
+                        return;
+                    }
                     (None, _) => {}
                 }
                 cx.stop_propagation();
@@ -373,10 +430,12 @@ impl Workspace {
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = *theme(cx);
+        self.row_panel.on_screen.set(false);
         // Deferred to render for the `&mut Window` a background task does not
         // have: the catalog that names these tabs resolves off-thread, and a
         // grid cannot be built without a window.
         self.restore_objects(window, cx);
+        self.sync_page_input(window, cx);
         // Where a query tab that reached the front without `activate_tab` gets
         // its snapshot read. `session.active` is written in six places --
         // `Session::new`, `activate_tab`, `close_object`, `escape`,
@@ -473,7 +532,7 @@ impl Render for Workspace {
                 .on_action(cx.listener(Self::previous_profile))
                 // Without a titlebar of its own the form has no drag handle at
                 // all, since the platform's is transparent.
-                .child(titlebar(t, None, None, None, None))
+                .child(titlebar(None, Vec::new()))
                 .child(
                     div()
                         .flex_1()
@@ -492,9 +551,10 @@ impl Render for Workspace {
                 t.text_muted,
             ),
             // Connected is the one state worth spending on decoration: every
-            // other one is news, and news beats which connection this is.
+            // other one is news, and news beats where the connection points.
+            // Its name is already on the switcher in the titlebar.
             ProfileState::Connected(_) => (
-                format!("{} · {}", profile.name, profile.config.endpoint()),
+                profile.config.endpoint(),
                 profile.color.map_or(t.success, ConnectionColor::swatch),
             ),
             ProfileState::Failed(message) => (message.clone(), t.danger),
@@ -552,6 +612,7 @@ impl Render for Workspace {
             .child(views::render_main_content(
                 profile,
                 self.settings.editor_font_size,
+                &self.row_panel,
                 cx,
             ));
         // With the sidebar folded there is nothing to split, and a split with
@@ -580,6 +641,7 @@ impl Render for Workspace {
             .track_focus(&self.focus)
             .on_action(cx.listener(Self::run_query))
             .on_action(cx.listener(Self::explain_query))
+            .on_action(cx.listener(Self::format_query))
             .on_action(cx.listener(Self::choose_mode))
             .on_action(cx.listener(Self::reset_confirmations))
             .on_action(cx.listener(Self::cancel_query))
@@ -587,6 +649,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::discard_edits))
             .on_action(cx.listener(Self::sort_column))
             .on_action(cx.listener(Self::set_row_limit))
+            .on_action(cx.listener(Self::refresh_active_relation))
             .on_action(cx.listener(Self::next_page))
             .on_action(cx.listener(Self::previous_page))
             .on_action(cx.listener(Self::clear_filter))
@@ -616,6 +679,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::palette_next))
             .on_action(cx.listener(Self::palette_previous))
             .on_action(cx.listener(Self::toggle_sidebar))
+            .on_action(cx.listener(Self::toggle_row_panel))
             .on_action(cx.listener(Self::accept_completion))
             .on_action(cx.listener(Self::open_settings))
             .size_full()
@@ -628,9 +692,6 @@ impl Render for Workspace {
             .flex()
             .flex_col()
             .child(titlebar(
-                t,
-                Some(profile.name.clone()),
-                profile.color,
                 Some({
                     let mode = profile.mode;
                     let silenced = profile.confirmed.clone();
@@ -666,7 +727,7 @@ impl Render for Workspace {
                         })
                         .into_any_element()
                 }),
-                Some(
+                vec![
                     icon_button(
                         "toggle-sidebar",
                         icon::SIDEBAR,
@@ -678,7 +739,8 @@ impl Render for Workspace {
                         workspace.toggle_sidebar(&ToggleSidebar, window, cx);
                     }))
                     .into_any_element(),
-                ),
+                    self.render_profile_switcher(cx),
+                ],
             ))
             .child(div().flex_1().min_h_0().child(main_pane))
             .child(
@@ -809,6 +871,45 @@ pub(crate) fn editor_zoom_percent(font_size: f32) -> u32 {
     (font_size / EDITOR_FONT_SIZE_DEFAULT * 100.0).round() as u32
 }
 
+pub(crate) fn adjusted_opacity(current: f32, delta: f32) -> f32 {
+    (current + delta).clamp(theme::OPACITY_MIN, theme::OPACITY_MAX)
+}
+
+/// An opacity read back from disk, clamped for the same reason the zoom is:
+/// `profiles.toml` is a text file, and a value outside the range the controls
+/// offer is one they cannot walk back. NaN would survive the `clamp`.
+pub(crate) fn restored_opacity(stored: Option<f32>) -> f32 {
+    stored
+        .filter(|opacity| opacity.is_finite())
+        .map(|opacity| opacity.clamp(theme::OPACITY_MIN, theme::OPACITY_MAX))
+        .unwrap_or(theme::OPACITY_DEFAULT)
+}
+
+pub(crate) fn opacity_percent(opacity: f32) -> u32 {
+    (opacity * 100.0).round() as u32
+}
+
+/// A percentage someone typed, back into the fraction the theme wants.
+///
+/// Out of range is clamped rather than refused -- the field is a shortcut past
+/// the `−` and `+` buttons, and those clamp too. Anything that is not a number
+/// at all, the empty field included, leaves the setting where it was; so does
+/// an infinity, which parses happily and would survive `clamp`.
+///
+/// The number already on screen is returned as the very f32 it came from
+/// rather than recomputed: stepping lands on values like 0.77000004, whose
+/// percentage divides back to a different f32, and `set_opacity` would take
+/// that for a change and rewrite `profiles.toml`.
+pub(crate) fn opacity_from_percent_input(typed: &str, current: f32) -> f32 {
+    let Ok(percent) = typed.trim().trim_end_matches('%').trim().parse::<f32>() else {
+        return current;
+    };
+    if !percent.is_finite() || percent.round() == opacity_percent(current) as f32 {
+        return current;
+    }
+    (percent / 100.0).clamp(theme::OPACITY_MIN, theme::OPACITY_MAX)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -848,6 +949,35 @@ mod tests {
         assert_eq!(
             restored_editor_font_size(Some(EDITOR_FONT_SIZE_DEFAULT + EDITOR_FONT_SIZE_STEP)),
             EDITOR_FONT_SIZE_DEFAULT + EDITOR_FONT_SIZE_STEP
+        );
+    }
+
+    #[test]
+    fn a_restored_opacity_is_clamped_rather_than_trusted() {
+        assert_eq!(restored_opacity(None), theme::OPACITY_DEFAULT);
+        assert_eq!(restored_opacity(Some(f32::NAN)), theme::OPACITY_DEFAULT);
+        assert_eq!(restored_opacity(Some(2.0)), theme::OPACITY_MAX);
+        assert_eq!(restored_opacity(Some(-1.0)), theme::OPACITY_MIN);
+        assert_eq!(restored_opacity(Some(0.8)), 0.8);
+    }
+
+    #[test]
+    fn a_typed_opacity_is_clamped_rather_than_refused() {
+        assert_eq!(opacity_from_percent_input("80", 0.72), 0.8);
+        assert_eq!(opacity_from_percent_input("85%", 0.72), 0.85);
+        assert_eq!(opacity_from_percent_input("  85 % ", 0.72), 0.85);
+        assert_eq!(opacity_from_percent_input("120", 0.72), theme::OPACITY_MAX);
+        assert_eq!(opacity_from_percent_input("10", 0.72), theme::OPACITY_MIN);
+        // Nothing to read is not a reason to change anything.
+        assert_eq!(opacity_from_percent_input("", 0.72), 0.72);
+        assert_eq!(opacity_from_percent_input("dark", 0.72), 0.72);
+        assert_eq!(opacity_from_percent_input("inf", 0.72), 0.72);
+        // Retyping what the readout says must be the same f32 it was showing,
+        // not the one the division would have produced.
+        let stepped = adjusted_opacity(theme::OPACITY_DEFAULT, theme::OPACITY_STEP);
+        assert_eq!(
+            opacity_from_percent_input(&opacity_percent(stepped).to_string(), stepped),
+            stepped
         );
     }
 
