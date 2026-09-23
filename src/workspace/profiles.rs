@@ -660,6 +660,55 @@ impl Workspace {
                     workspace.install_completions(&id, cx);
                     workspace.refresh_explorer(&id, cx);
                     cx.notify();
+                    workspace.load_routines(&id, generation, cx);
+                })
+                .ok();
+        })
+        .detach();
+    }
+
+    /// Fill the routines in behind the relations already on screen.
+    ///
+    /// A second request rather than a slower first one: the two are separate
+    /// queries on every engine, and where the routines are the slow half the
+    /// explorer would otherwise sit empty until they arrived.
+    ///
+    /// A failure here leaves the relations alone and is said once in the status
+    /// bar. Replacing a working explorer with an error because the functions
+    /// could not be listed would cost more than it reports.
+    fn load_routines(&mut self, id: &str, generation: u64, cx: &mut Context<Self>) {
+        let Some(profile) = self.issued_to(id, generation) else {
+            return;
+        };
+        let Some(connection) = profile.connection() else {
+            return;
+        };
+        let routines_task = cx
+            .background_executor()
+            .spawn(async move { connection.routines() });
+
+        let id = id.to_string();
+        cx.spawn(async move |workspace, cx| {
+            let result = routines_task.await;
+            workspace
+                .update(cx, |workspace, cx| {
+                    let Some(profile) = workspace.issued_to(&id, generation) else {
+                        return;
+                    };
+                    match result {
+                        // Only onto a catalog that loaded. One that failed, or
+                        // that a reconnect has already replaced, is not this
+                        // half's to complete.
+                        Ok(routines) => {
+                            if let CatalogState::Loaded(catalog) = &mut profile.catalog {
+                                catalog.merge(routines);
+                            }
+                        }
+                        Err(error) => workspace.note(error.message, cx),
+                    }
+                    workspace.install_completions(&id, cx);
+                    workspace.refresh_explorer(&id, cx);
+                    cx.notify();
                 })
                 .ok();
         })

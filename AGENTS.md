@@ -418,7 +418,9 @@ Decided, recorded in the multi-engine spec, and not to be re-litigated:
   USE", which `live_a_use_is_refused_rather_than_quietly_forgotten` pins. The database, warehouse, role, timeout and `MULTI_STATEMENT_COUNT`
   are fields of the request and never SQL — hard rule 1.
 - **Snowflake has no connection mutex**, alone among the four: there is no
-  socket to serialise, so a catalog load does not queue behind a slow query.
+  socket to serialise, so a catalog load does not queue behind a slow query,
+  and `snowflake::Connection::at_once` runs a structure load's four statements
+  on four threads rather than one after another (1.3s against 3.6s, measured).
   The consequence is that more than one statement can be in flight, so its
   `cancel` stops every handle the connection has running rather than one.
   Statements are always submitted `async=true`, because a synchronous submit
@@ -430,6 +432,18 @@ Decided, recorded in the multi-engine spec, and not to be re-litigated:
   decrypt PKCS#8). Password, OAuth, browser SSO and access tokens are not
   implemented. There is no `sslmode` to honour or weaken: the API is HTTPS and
   always verified against `webpki-roots`.
+- **An engine's own statements are submitted synchronously; the user's are
+  not.** The asynchronous submit exists so Cancel has a handle from the first
+  moment, and it costs a round trip -- 885ms against 315ms for three
+  `SELECT 1`s. Nothing offers to cancel a catalog load, so
+  `snowflake::Connection::internal_query` pays for neither.
+- **The relations and the routines are two loads, everywhere.**
+  `Connection::catalog` answers with relations alone and
+  `Connection::routines` follows behind it, merged in by `Catalog::merge` when
+  it lands. It is engine-agnostic by design, and Snowflake is why it exists:
+  `INFORMATION_SCHEMA.FUNCTIONS` and `PROCEDURES` took four and eight seconds
+  to report that a database had neither, with the tables in hand after two. A
+  routines load that fails leaves the relations on screen and says so once.
 - **Snowflake's catalog needs a running warehouse.** It is read through
   `INFORMATION_SCHEMA`, so connecting resumes a suspended warehouse and so does
   opening a Structure tab. That view has nothing naming the columns of a key,

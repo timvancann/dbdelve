@@ -494,12 +494,31 @@ impl Connection {
         }
     }
 
+    /// The relations of every schema, and no routines.
+    ///
+    /// Split from [`Connection::routines`] because the two are separate
+    /// queries on every engine and one of them is reliably the slower: on
+    /// Snowflake `INFORMATION_SCHEMA.PROCEDURES` took eight seconds to report
+    /// that there were none, with the tables already in hand after two. The
+    /// explorer is worth more open and incomplete than closed and correct, so
+    /// what arrives first is shown first.
     pub fn catalog(&self) -> Result<Catalog, DbError> {
         match self {
             Self::Postgres(connection) => connection.catalog(),
             Self::MySql(connection) => connection.catalog(),
             Self::Sqlite(connection) => connection.catalog(),
             Self::Snowflake(connection) => connection.catalog(),
+        }
+    }
+
+    /// The stored functions and procedures, as a catalog holding nothing else,
+    /// for [`Catalog::merge`] to fold into the one already on screen.
+    pub fn routines(&self) -> Result<Catalog, DbError> {
+        match self {
+            Self::Postgres(connection) => connection.routines(),
+            Self::MySql(connection) => connection.routines(),
+            Self::Sqlite(connection) => connection.routines(),
+            Self::Snowflake(connection) => connection.routines(),
         }
     }
 
@@ -700,6 +719,28 @@ pub struct Schema {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Catalog {
     pub schemas: Vec<Schema>,
+}
+
+impl Catalog {
+    /// Fold a later half into this one: the routines of a schema already here
+    /// join it, and a schema that holds only routines is added in its place.
+    ///
+    /// Assembled by name rather than by position, because the two halves are
+    /// separate queries and a schema can appear in either alone -- one holding
+    /// only functions is in the second and not the first.
+    pub fn merge(&mut self, other: Self) {
+        for schema in other.schemas {
+            match self
+                .schemas
+                .iter_mut()
+                .find(|existing| existing.name == schema.name)
+            {
+                Some(existing) => existing.routines = schema.routines,
+                None => self.schemas.push(schema),
+            }
+        }
+        self.schemas.sort_by(|a, b| a.name.cmp(&b.name));
+    }
 }
 
 /// One relation's definition. Loaded when the relation is opened rather than at
@@ -1263,6 +1304,71 @@ mod tests {
         // There is no session for a setting to live on.
         assert_eq!(read_only_statement(Engine::Snowflake, true), None);
         assert_eq!(read_only_statement(Engine::Snowflake, false), None);
+    }
+
+    fn schema(name: &str, relations: &[&str], routines: &[&str]) -> Schema {
+        Schema {
+            name: name.to_string(),
+            relations: relations
+                .iter()
+                .map(|name| Relation {
+                    name: (*name).to_string(),
+                    kind: RelationKind::Table,
+                    partition_of: None,
+                })
+                .collect(),
+            routines: routines
+                .iter()
+                .map(|name| Routine {
+                    name: (*name).to_string(),
+                    kind: RoutineKind::Function,
+                    identity_arguments: String::new(),
+                    result_type: String::new(),
+                    language: String::new(),
+                    definition: String::new(),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn the_second_half_of_a_catalog_joins_the_first_by_name() {
+        let mut catalog = Catalog {
+            schemas: vec![
+                schema("public", &["accounts"], &[]),
+                schema("ops", &["jobs"], &[]),
+            ],
+        };
+        catalog.merge(Catalog {
+            schemas: vec![
+                schema("public", &[], &["digest"]),
+                // A schema holding only functions is in the second half alone,
+                // and is a schema the explorer has to show.
+                schema("audit", &[], &["trail"]),
+            ],
+        });
+
+        let named = |name: &str| {
+            catalog
+                .schemas
+                .iter()
+                .find(|schema| schema.name == name)
+                .unwrap_or_else(|| panic!("{name} is listed"))
+        };
+        // The relations it already had are untouched, and its routines arrive.
+        assert_eq!(named("public").relations.len(), 1);
+        assert_eq!(named("public").routines[0].name, "digest");
+        assert_eq!(named("audit").relations, []);
+        assert_eq!(named("ops").routines, []);
+        // Still in one order, wherever each schema came from.
+        assert_eq!(
+            catalog
+                .schemas
+                .iter()
+                .map(|s| s.name.as_str())
+                .collect::<Vec<_>>(),
+            ["audit", "ops", "public"]
+        );
     }
 
     #[test]

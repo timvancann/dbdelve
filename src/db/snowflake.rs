@@ -726,8 +726,18 @@ impl Connection {
     /// Structure tab. That is the price of the idiomatic catalog, and it is
     /// the server's message the user sees when there is no warehouse to run.
     pub fn catalog(&self) -> Result<Catalog, DbError> {
-        let [relations, routines] = self.at_once([RELATIONS_SQL.into(), ROUTINES_SQL.into()])?;
-        assemble_catalog(relations, routines)
+        assemble_catalog(self.internal_query(RELATIONS_SQL)?, QueryResult::default())
+    }
+
+    /// The slow half here, and by a distance: `INFORMATION_SCHEMA.FUNCTIONS`
+    /// and `PROCEDURES` took four and eight seconds to report that this
+    /// database had neither, where the relations were in hand after two. It is
+    /// asked for on its own so the explorer does not wait on it, and the two
+    /// views are asked separately so it costs the slower rather than both.
+    pub fn routines(&self) -> Result<Catalog, DbError> {
+        let [functions, procedures] =
+            self.at_once([FUNCTIONS_SQL.into(), PROCEDURES_SQL.into()])?;
+        assemble_catalog(QueryResult::default(), appended(functions, procedures)?)
     }
 
     pub fn structure(&self, schema: &str, relation: &str) -> Result<Structure, DbError> {
@@ -834,7 +844,7 @@ FROM INFORMATION_SCHEMA.TABLES
 WHERE TABLE_SCHEMA <> 'INFORMATION_SCHEMA'
 ORDER BY 1, 2"#;
 
-const ROUTINES_SQL: &str = r#"
+const FUNCTIONS_SQL: &str = r#"
 SELECT FUNCTION_SCHEMA AS "schema_name",
        FUNCTION_NAME AS "routine_name",
        'function' AS "routine_kind",
@@ -843,16 +853,32 @@ SELECT FUNCTION_SCHEMA AS "schema_name",
        COALESCE(FUNCTION_LANGUAGE, '') AS "language",
        COALESCE(FUNCTION_DEFINITION, '') AS "definition"
 FROM INFORMATION_SCHEMA.FUNCTIONS
-UNION ALL
-SELECT PROCEDURE_SCHEMA,
-       PROCEDURE_NAME,
-       'procedure',
-       COALESCE(ARGUMENT_SIGNATURE, ''),
-       COALESCE(DATA_TYPE, ''),
-       COALESCE(PROCEDURE_LANGUAGE, ''),
-       COALESCE(PROCEDURE_DEFINITION, '')
+ORDER BY 1, 2"#;
+
+const PROCEDURES_SQL: &str = r#"
+SELECT PROCEDURE_SCHEMA AS "schema_name",
+       PROCEDURE_NAME AS "routine_name",
+       'procedure' AS "routine_kind",
+       COALESCE(ARGUMENT_SIGNATURE, '') AS "identity_arguments",
+       COALESCE(DATA_TYPE, '') AS "result_type",
+       COALESCE(PROCEDURE_LANGUAGE, '') AS "language",
+       COALESCE(PROCEDURE_DEFINITION, '') AS "definition"
 FROM INFORMATION_SCHEMA.PROCEDURES
 ORDER BY 1, 2"#;
+
+/// Two results of the same shape as one, for an assembler that takes one.
+///
+/// The columns are compared rather than assumed: the two are separate
+/// statements, and a row read under the wrong header is worse than an error.
+fn appended(mut first: QueryResult, second: QueryResult) -> Result<QueryResult, DbError> {
+    if first.columns != second.columns {
+        return Err(plain_error(
+            "Two catalog queries answered with different columns.".to_string(),
+        ));
+    }
+    first.rows.extend(second.rows);
+    Ok(first)
+}
 
 /// The type is spelled the way a result column's is, lower case with its
 /// precision, so a relation reads the same in its Structure tab and its grid.
@@ -1570,6 +1596,27 @@ mod tests {
     }
 
     #[test]
+    fn two_routine_results_are_one_only_when_they_agree() {
+        let functions = result(
+            &["schema_name", "routine_name"],
+            &[&[Some("app"), Some("f")]],
+        );
+        let procedures = result(
+            &["schema_name", "routine_name"],
+            &[&[Some("app"), Some("p")]],
+        );
+        assert_eq!(
+            appended(functions.clone(), procedures)
+                .expect("same shape")
+                .rows
+                .len(),
+            2
+        );
+        let other = result(&["schema_name"], &[&[Some("app")]]);
+        assert!(appended(functions, other).is_err());
+    }
+
+    #[test]
     fn a_catalog_result_in_its_aliases_is_what_the_assemblers_read() {
         // The aliases in the SQL above and the names the shared assemblers look
         // up are the same strings in two places; this is what holds them together.
@@ -1588,7 +1635,9 @@ mod tests {
             "language",
             "definition",
         ] {
-            assert!(ROUTINES_SQL.contains(&format!("AS \"{alias}\"")), "{alias}");
+            for sql in [FUNCTIONS_SQL, PROCEDURES_SQL] {
+                assert!(sql.contains(&format!("AS \"{alias}\"")), "{alias}");
+            }
         }
         for alias in ["column_name", "data_type", "nullable", "column_default"] {
             assert!(COLUMNS_SQL.contains(&format!("AS \"{alias}\"")), "{alias}");
@@ -1783,25 +1832,28 @@ mod tests {
 
     #[test]
     #[ignore = "requires a Snowflake account configured through DBDELVE_SNOWFLAKE_*"]
-    fn live_bench_catalog_and_structure() {
+    fn live_the_explorer_does_not_wait_on_the_routines() {
+        // The relations are what the explorer opens with, so the half that is
+        // reliably slower must not be in front of them.
         let connection = Connection::open(&live_config()).expect("connects");
-        let schema = std::env::var("DBDELVE_SNOWFLAKE_SCHEMA")
-            .unwrap_or_else(|_| "L4_BEDRIJFSVOERING_SERVICES".into());
-        let relation =
-            std::env::var("DBDELVE_SNOWFLAKE_RELATION").unwrap_or_else(|_| "F_LLM_KOSTEN".into());
+        let started = Instant::now();
+        let catalog = connection.catalog().expect("relations");
+        let relations = started.elapsed();
+        assert!(
+            catalog
+                .schemas
+                .iter()
+                .any(|schema| !schema.relations.is_empty())
+        );
+        assert!(
+            catalog
+                .schemas
+                .iter()
+                .all(|schema| schema.routines.is_empty())
+        );
 
         let started = Instant::now();
-        let catalog = connection.catalog().expect("catalog");
-        println!(
-            "{:>8?}  catalog(), {} schemas",
-            started.elapsed(),
-            catalog.schemas.len()
-        );
-        let started = Instant::now();
-        connection.structure(&schema, &relation).expect("structure");
-        println!("{:>8?}  structure()", started.elapsed());
-        let started = Instant::now();
-        connection.query("SELECT 1").expect("query");
-        println!("{:>8?}  a user's SELECT 1", started.elapsed());
+        connection.routines().expect("routines");
+        println!("relations {relations:?}, routines {:?}", started.elapsed());
     }
 }

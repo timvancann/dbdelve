@@ -64,6 +64,9 @@ chmod 600 ~/.ssh/snowflake.p8
 
 ## Things that behave differently here
 
+- **The explorer fills in twice.** Tables and views appear first; functions and
+  procedures follow a few seconds later. Listing routines is the slowest thing
+  Snowflake's catalog is asked for, and it is not worth waiting on.
 - **Connecting resumes the warehouse.** The catalog is read from
   `INFORMATION_SCHEMA`, which needs a running warehouse, and so does opening a
   Structure tab. With no warehouse at all the connection opens and the catalog
